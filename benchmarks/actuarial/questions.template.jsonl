@@ -1,0 +1,4 @@
+# Replace expected_sources with local filenames from public_sources.jsonl.
+# retrieval_query should be a compact query the Agent can issue, not the full question.
+# required_evidence_phrases must appear in Read-produced Evidence from the expected source.
+{"case_id":"example-001","question":"What does the selected standard require?","retrieval_query":"distinctive phrase from the standard","expected_sources":["local-source.pdf"],"required_phrases":["answer phrase"],"required_evidence_phrases":["verbatim source phrase"],"answerable":true,"must_cite":true}

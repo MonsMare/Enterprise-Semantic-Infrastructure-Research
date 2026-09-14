@@ -73,3 +73,18 @@ def test_agent_loop_refuses_to_answer_when_no_evidence_was_read():
 
     assert result.evidence == []
     assert "没有读取到可引用的知识证据" in result.answer
+
+
+def test_agent_explains_compact_and_multi_part_search_strategy_to_model():
+    provider = MemoryProvider({"guide.md": "A factual statement."})
+    model = ScriptedModel([{"content": "I need to search first."}])
+
+    AgentLoop(model).run("What is the answer?", provider)
+
+    system_instructions = model.calls[0][0][0]["content"]
+    search_tool = next(
+        tool["function"] for tool in model.calls[0][1] if tool["function"]["name"] == "search"
+    )
+    assert "2 to 5" in system_instructions
+    assert "separate targeted searches" in system_instructions
+    assert "2 to 5" in search_tool["description"]

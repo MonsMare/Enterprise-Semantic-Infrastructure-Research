@@ -16,10 +16,10 @@ python -m pip install -e ".[dev,pdf]"
 $env:MINERU_API_KEY = "<rotated MinerU token>"
 $env:LLM_API_KEY = "<rotated LLM key>"
 $env:LLM_BASE_URL = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
-$env:LLM_MODEL = "deepseek-v4.1-flash"
+$env:LLM_MODEL = "qwen3.8-max"
 ```
 
-可选模型：`deepseek-v4.1-flash`、`qwen3.8-max`。
+当前 Agent `ask` 和 `benchmark` 命令固定使用 `qwen3.8-max`。OpenAI-compatible client 保留 DeepSeek 适配能力供非 Agent 用途；Agent 评测不接受切换到其他模型。
 
 ## 文档解析
 
@@ -44,6 +44,23 @@ python -m knowledge_runtime.cli ask "恢复码多久过期？" --model qwen3.8-m
 Agent Loop 最多执行 8 次模型请求，单轮累计读取默认限制为 20 KB。回答必须引用 Read 产生的 Evidence ID；没有读取到 Evidence 时会拒答。可以通过 `--max-iterations` 与 `--max-read-bytes` 调整 POC 限制。
 
 当前 lexical search 使用不区分大小写的字面子串匹配；`find` 按名称子串或 glob 模式匹配，`scope` 是资源 ID 的路径前缀。Search 顺序按资源名称与命中行稳定排序，分页游标绑定查询和结果 snapshot。
+
+## 数据库存储与 benchmark
+
+将 `--store` 指向 `.db`、`.sqlite` 或 `.sqlite3` 文件时，Runtime 使用 SQLite 资产库：
+
+```powershell
+python .\benchmarks\actuarial\fetch_sources.py --output .kr-data/actuarial-downloads
+python -m knowledge_runtime.cli ingest .kr-data/actuarial-downloads --backend local --store .kr-data/knowledge.db
+python -m knowledge_runtime.cli catalog --store .kr-data/knowledge.db
+python -m knowledge_runtime.cli benchmark .\benchmarks\actuarial\questions.jsonl --store .kr-data/knowledge.db --model qwen3.8-max --output .kr-data/actuarial-report.json
+```
+
+SQLite 会事务化保存当前资产、每次 source revision、解析器 provenance、Markdown、content list、metadata 和派生文件；同一资产的历史 source revision 不会被覆盖。`AssetKnowledgeProvider` 使用 SQLite FTS 查询当前版本，并在读取前从数据库检查资产 revision，因此重新入库后旧 Locator 会失效，而不是继续读取旧内容。
+
+精算公开文档目录位于 `benchmarks/actuarial/public_sources.jsonl`，涵盖 ASB、CAS、SOA、NAIC、EIOPA 和 GAD。目录保存官方来源地址和评测元数据；下载清单记录来源、抓取时间和 SHA-256。文档保存在 `.kr-data/`，不会进入 Git。下载前应核对来源机构的许可和使用条款。
+
+Benchmark JSONL 按预期来源、回答关键短语和 Evidence 必含原文短语评分。报告包含 Hit@1、Hit@3、MRR、端到端 p50/p95、search/read 用时和 Evidence 字节数。要跑真实 Qwen 评测，需先在本机设置 `LLM_API_KEY`；测试套件使用 ScriptedModel，不会发起模型 API 调用。
 
 ## 检查
 

@@ -36,7 +36,7 @@ class OpenAICompatibleClient:
     ) -> None:
         self.api_key = api_key or os.environ.get("LLM_API_KEY", "")
         self.base_url = (base_url or os.environ.get("LLM_BASE_URL", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")).rstrip("/")
-        self.model = model or os.environ.get("LLM_MODEL", "deepseek-v4.1-flash")
+        self.model = model or os.environ.get("LLM_MODEL", "qwen3.8-max")
         self.timeout = timeout
         if self.model not in ALLOWED_MODELS:
             raise ValueError(f"model must be one of: {', '.join(sorted(ALLOWED_MODELS))}")

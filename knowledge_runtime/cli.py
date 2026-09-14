@@ -7,9 +7,16 @@ from pathlib import Path
 
 from .agent_loop import AgentLoop
 from .asset_provider import AssetKnowledgeProvider
-from .assets import KnowledgeAssetStore
+from .assets import KnowledgeAssetStore, SQLiteKnowledgeAssetStore
 from .enrichment import OpenAICompatibleEnricher
 from .errors import KnowledgeRuntimeError
+from .evaluation import (
+    BenchmarkRunner,
+    RetrievalBenchmarkRunner,
+    load_cases,
+    write_report,
+    write_retrieval_report,
+)
 from .extractors import LocalExtractionBackend
 from .llm_client import OpenAICompatibleClient
 from .mineru_backend import MinerUCloudBackend
@@ -34,13 +41,40 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--store", type=Path, default=Path(".kr-data/assets"))
     ask.add_argument("--max-iterations", type=int, default=8)
     ask.add_argument("--max-read-bytes", type=int, default=20_000)
-    ask.add_argument("--model", choices=("deepseek-v4.1-flash", "qwen3.8-max"))
+    ask.add_argument("--model", choices=("qwen3.8-max",), default="qwen3.8-max")
+
+    benchmark = commands.add_parser("benchmark", help="run a JSONL benchmark through the Agent Retrieval Loop")
+    benchmark.add_argument("cases", type=Path)
+    benchmark.add_argument("--store", type=Path, default=Path(".kr-data/assets"))
+    benchmark.add_argument("--output", type=Path)
+    benchmark.add_argument("--max-iterations", type=int, default=8)
+    benchmark.add_argument("--max-read-bytes", type=int, default=20_000)
+    benchmark.add_argument("--model", choices=("qwen3.8-max",), default="qwen3.8-max")
+
+    retrieval_benchmark = commands.add_parser(
+        "benchmark-retrieval", help="run deterministic search-and-read checks without an LLM call"
+    )
+    retrieval_benchmark.add_argument("cases", type=Path)
+    retrieval_benchmark.add_argument("--store", type=Path, default=Path(".kr-data/assets"))
+    retrieval_benchmark.add_argument("--output", type=Path)
+    retrieval_benchmark.add_argument("--max-read-bytes", type=int, default=20_000)
+
+    catalog = commands.add_parser("catalog", help="inspect persisted knowledge assets and revisions")
+    catalog.add_argument("--store", type=Path, default=Path(".kr-data/assets"))
+    catalog.add_argument("--asset-id")
     return parser
+
+
+def open_asset_store(path: Path):
+    """Select the operational store from the path without changing the CLI shape."""
+    if path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
+        return SQLiteKnowledgeAssetStore(path)
+    return KnowledgeAssetStore(path)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    store = KnowledgeAssetStore(args.store)
+    store = open_asset_store(args.store)
     try:
         if args.command == "ingest":
             if not args.source.is_file():
@@ -68,13 +102,62 @@ def main(argv: list[str] | None = None) -> int:
             for source in sources:
                 try:
                     asset = backend.extract(source, store=store)
-                    assets.append({"asset_id": asset.asset_id, "source_name": asset.source_name, "source_hash": asset.source_hash, "parser": asset.parser_name, "parser_version": asset.parser_version})
+                    assets.append({"asset_id": asset.asset_id, "source_name": asset.source_name, "source_hash": asset.source_hash, "revision_id": asset.revision_id, "parser": asset.parser_name, "parser_version": asset.parser_version})
                 except KnowledgeRuntimeError as exc:
                     errors.append({"source": str(source), "error": str(exc)})
             print(json.dumps({"assets": assets, "errors": errors, "asset_store": str(args.store)}, ensure_ascii=False, indent=2))
             return 2 if errors else 0
 
+        if args.command == "catalog":
+            assets = store.list_assets()
+            if args.asset_id:
+                assets = [asset for asset in assets if asset.asset_id == args.asset_id]
+            payload = {
+                "store": str(args.store),
+                "assets": [
+                    {
+                        "asset_id": asset.asset_id,
+                        "source_name": asset.source_name,
+                        "source_path": asset.source_path,
+                        "source_hash": asset.source_hash,
+                        "revision_id": asset.revision_id,
+                        "parser": asset.parser_name,
+                        "parser_version": asset.parser_version,
+                        "revisions": store.list_revisions(asset.asset_id)
+                        if hasattr(store, "list_revisions")
+                        else [],
+                    }
+                    for asset in assets
+                ],
+            }
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
+
         provider = AssetKnowledgeProvider(store)
+        if args.command == "benchmark-retrieval":
+            report = RetrievalBenchmarkRunner().run(
+                load_cases(args.cases),
+                provider,
+                max_read_bytes=args.max_read_bytes,
+            )
+            if args.output:
+                write_retrieval_report(report, args.output)
+            print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2))
+            return 0 if report.passed == report.total else 1
+
+        if args.command == "benchmark":
+            model = OpenAICompatibleClient(model=args.model)
+            report = BenchmarkRunner(model, model_name=args.model).run(
+                load_cases(args.cases),
+                provider,
+                max_iterations=args.max_iterations,
+                max_read_bytes=args.max_read_bytes,
+            )
+            if args.output:
+                write_report(report, args.output)
+            print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2))
+            return 0 if report.passed == report.total else 1
+
         model = OpenAICompatibleClient(model=args.model)
         result = AgentLoop(model).run(
             args.question,
@@ -91,6 +174,9 @@ def main(argv: list[str] | None = None) -> int:
     except (KnowledgeRuntimeError, FileNotFoundError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    finally:
+        if hasattr(store, "close"):
+            store.close()
 
 
 if __name__ == "__main__":

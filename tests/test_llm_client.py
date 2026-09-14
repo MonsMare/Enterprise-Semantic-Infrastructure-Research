@@ -46,6 +46,14 @@ def test_client_rejects_models_outside_user_allowlist():
         OpenAICompatibleClient(api_key="test", model="unapproved-model")
 
 
+def test_client_defaults_to_qwen_for_agent_runtime(monkeypatch):
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+
+    client = OpenAICompatibleClient(api_key="test-only-secret")
+
+    assert client.model == "qwen3.8-max"
+
+
 def test_client_requires_key_without_echoing_it(monkeypatch):
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     client = OpenAICompatibleClient(api_key="", model="deepseek-v4.1-flash")
