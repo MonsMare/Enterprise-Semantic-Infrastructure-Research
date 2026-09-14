@@ -748,19 +748,34 @@ class SQLiteKnowledgeAssetStore:
             text=row["text"],
         )
 
-    def list_current_chunks(self, asset_id: str | None = None) -> list[KnowledgeChunk]:
-        """List chunks projected from each asset's current revision."""
+    def list_current_chunks(
+        self,
+        asset_id: str | None = None,
+        *,
+        scope: str | None = None,
+    ) -> list[KnowledgeChunk]:
+        """List current chunks, optionally constrained by asset id or source scope."""
         query = """
             SELECT c.chunk_id, c.asset_id, c.revision_id, c.source_name,
                    c.heading_path_json, c.start_line, c.end_line, c.text
             FROM asset_chunks c
             JOIN assets a
               ON a.asset_id = c.asset_id AND a.current_revision_id = c.revision_id
+            JOIN asset_revisions r
+              ON r.asset_id = c.asset_id AND r.revision_id = c.revision_id
         """
         params: list[Any] = []
+        conditions: list[str] = []
         if asset_id is not None:
-            query += " WHERE c.asset_id = ?"
+            conditions.append("c.asset_id = ?")
             params.append(asset_id)
+        if scope is not None and scope.strip():
+            conditions.append(
+                "(a.asset_id = ? OR lower(r.source_name) = lower(?) OR lower(r.source_path) = lower(?))"
+            )
+            params.extend((scope, scope, scope))
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY lower(c.source_name), c.asset_id, c.start_line, c.end_line, c.chunk_id"
         with self._lock:
             rows = self.connection.execute(query, params).fetchall()

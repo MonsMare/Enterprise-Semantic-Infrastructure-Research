@@ -12,6 +12,7 @@ from knowledge_runtime.asset_provider import AssetKnowledgeProvider
 from knowledge_runtime.errors import KRStaleLocator
 from knowledge_runtime.extractors import LocalExtractionBackend
 from knowledge_runtime.mineru_backend import MinerUCloudBackend
+from knowledge_runtime.models import SearchOptions
 
 
 def test_local_backend_creates_asset_with_source_and_parser_provenance(tmp_path):
@@ -105,6 +106,154 @@ def test_sqlite_store_searches_current_chunks_and_honors_asset_scope(tmp_path):
     assert chunk.asset_id == first.asset_id
     assert "shared phrase" in chunk.text
     assert isinstance(score, float)
+    store.close()
+
+
+def test_asset_provider_returns_chunk_locators_and_chunk_evidence(tmp_path):
+    source = tmp_path / "guide.md"
+    source.write_text(
+        "# Guide\n\nIntroductory material.\n\n"
+        "## Payment rule\n\nAnnual review preserves the reserve evidence.\n",
+        encoding="utf-8",
+    )
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+    asset = LocalExtractionBackend().extract(source, store=store)
+    provider = AssetKnowledgeProvider(store)
+    expected_chunk = next(
+        chunk for chunk in store.list_current_chunks(asset.asset_id)
+        if "Annual review" in chunk.text
+    )
+
+    hit = provider.search("reserve evidence").items[0]
+
+    assert hit.locator.resource_id == asset.asset_id
+    assert hit.locator.selector == {
+        "type": "chunk",
+        "id": expected_chunk.chunk_id,
+        "start": expected_chunk.start_line,
+        "end": expected_chunk.end_line,
+    }
+    evidence = provider.read(hit.locator)
+    assert evidence.content == expected_chunk.text
+    assert evidence.resolved_selector == hit.locator.selector
+    assert evidence.derived_from == asset.asset_id
+    assert evidence.source_label == source.name
+    assert provider.stat(hit.locator)["size_bytes"] == len(expected_chunk.text.encode("utf-8"))
+    store.close()
+
+
+@pytest.mark.parametrize("scope_field", ["asset_id", "source_name", "source_path"])
+def test_asset_provider_scoped_multiterm_search_stays_in_sqlite_chunks(tmp_path, scope_field):
+    target_source = tmp_path / "target-policy.md"
+    target_source.write_text(
+        "# Target policy\n\nThe reserve is documented here.\n\n"
+        "Annual review is required later.\n",
+        encoding="utf-8",
+    )
+    other_source = tmp_path / "other-policy.md"
+    other_source.write_text(
+        "# Other policy\n\nThe reserve schedule includes an annual review.\n",
+        encoding="utf-8",
+    )
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+    backend = LocalExtractionBackend()
+    target = backend.extract(target_source, store=store)
+    backend.extract(other_source, store=store)
+    provider = AssetKnowledgeProvider(store)
+    scope = {
+        "asset_id": target.asset_id,
+        "source_name": target.source_name,
+        "source_path": target.source_path,
+    }[scope_field]
+
+    page = provider.search("reserve annual", scope=scope, options=SearchOptions(limit=10))
+
+    assert page.items
+    assert all(hit.locator.resource_id == target.asset_id for hit in page.items)
+    assert any("Annual review" in provider.read(hit.locator).content for hit in page.items)
+    assert all(hit.locator.selector["type"] == "chunk" for hit in page.items)
+    store.close()
+
+
+def test_asset_provider_fuses_local_ngram_rank_with_fts_rank(tmp_path):
+    lexical_source = tmp_path / "solvency-solvency-solvency.md"
+    lexical_source.write_text(
+        "# Archive\n\nThe old record is retained.",
+        encoding="utf-8",
+    )
+    semantic_source = tmp_path / "target.md"
+    semantic_source.write_text(
+        "# Target\n\nSolvencies and claims are reviewed together.",
+        encoding="utf-8",
+    )
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+    backend = LocalExtractionBackend()
+    backend.extract(lexical_source, store=store)
+    backend.extract(semantic_source, store=store)
+    provider = AssetKnowledgeProvider(store)
+    query = "solvency claims"
+
+    lexical_hits = provider.search(
+        query,
+        options=SearchOptions(limit=10, semantic_weight=0.0),
+    ).items
+    hybrid_hits = provider.search(
+        query,
+        options=SearchOptions(limit=10, semantic_weight=0.8),
+    ).items
+
+    assert lexical_hits[0].display_name == lexical_source.name
+    assert hybrid_hits[0].display_name == semantic_source.name
+    assert [hit.locator.selector["id"] for hit in hybrid_hits] == [
+        hit.locator.selector["id"]
+        for hit in provider.search(
+            query,
+            options=SearchOptions(limit=10, semantic_weight=0.8),
+        ).items
+    ]
+    store.close()
+
+
+def test_asset_provider_accepts_an_injected_semantic_encoder(tmp_path):
+    lexical_source = tmp_path / "lexical.md"
+    lexical_source.write_text("# Lexical\n\nQuery marker appears here.", encoding="utf-8")
+    semantic_source = tmp_path / "semantic.md"
+    semantic_source.write_text("# Semantic\n\nSemantic target phrase is related.", encoding="utf-8")
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+    backend = LocalExtractionBackend()
+    backend.extract(lexical_source, store=store)
+    backend.extract(semantic_source, store=store)
+
+    class MarkerEncoder:
+        def __init__(self):
+            self.inputs = []
+
+        def encode(self, text):
+            self.inputs.append(text)
+            if text.casefold().strip() == "query marker" or "semantic target phrase" in text.casefold():
+                return (1.0, 0.0)
+            return (0.0, 1.0)
+
+    encoder = MarkerEncoder()
+    try:
+        provider = AssetKnowledgeProvider(store, semantic_encoder=encoder)
+    except TypeError as exc:
+        pytest.fail(f"asset provider must allow an injected semantic encoder: {exc}")
+
+    hits = provider.search(
+        "query marker",
+        options=SearchOptions(limit=10, semantic_weight=0.8),
+    ).items
+
+    assert hits[0].display_name == semantic_source.name
+    assert "query marker" in encoder.inputs
+    assert any("semantic target phrase" in item.casefold() for item in encoder.inputs)
+
+    semantic_only_hits = provider.search(
+        "query marker",
+        options=SearchOptions(limit=10, semantic_weight=1.0),
+    ).items
+    assert [hit.display_name for hit in semantic_only_hits] == [semantic_source.name]
     store.close()
 
 
@@ -272,11 +421,12 @@ def test_sqlite_fts_multiword_search_reads_all_matching_terms(tmp_path):
     LocalExtractionBackend().extract(source, store=store)
     provider = AssetKnowledgeProvider(store)
 
-    hit = provider.search("actuarial quarterly").items[0]
-    evidence = provider.read(hit.locator)
+    hits = provider.search("actuarial quarterly").items
+    evidence = [provider.read(hit.locator).content for hit in hits]
 
-    assert "actuarial estimate" in evidence.content
-    assert "quarterly review" in evidence.content
+    assert any("actuarial estimate" in item for item in evidence)
+    assert any("quarterly review" in item for item in evidence)
+    assert all(hit.locator.selector["type"] == "chunk" for hit in hits)
     store.close()
 
 

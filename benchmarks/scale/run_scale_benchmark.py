@@ -140,8 +140,11 @@ def run_scale_benchmark(
         ]
 
     return {
-        "benchmark": "knowledge-runtime-sqlite-fts-scale-v1",
-        "pipeline": "AssetKnowledgeProvider.search -> SQLite FTS -> Locator -> Read -> Evidence",
+        "benchmark": "knowledge-runtime-chunk-hybrid-scale-v2",
+        "pipeline": (
+            "AssetKnowledgeProvider.search -> SQLite chunk index -> Hybrid RRF -> "
+            "Locator -> Read -> Evidence"
+        ),
         "llm_calls": 0,
         "seed": seed,
         "config": {

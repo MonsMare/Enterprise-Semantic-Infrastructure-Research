@@ -31,10 +31,18 @@ def test_scale_report_separates_discriminative_and_broad_queries_and_measures_ev
     )
 
     assert report["llm_calls"] == 0
+    assert report["benchmark"] == "knowledge-runtime-chunk-hybrid-scale-v2"
+    assert report["pipeline"].startswith(
+        "AssetKnowledgeProvider.search -> SQLite chunk index -> Hybrid RRF -> Locator -> Read -> Evidence"
+    )
     assert [run["corpus"]["documents"] for run in report["runs"]] == [4, 8]
     precise = report["runs"][0]["metrics"]["by_query_kind"]["precise"]
     broad_at_larger_scale = report["runs"][1]["metrics"]["by_query_kind"]["broad"]
     assert precise["hit_at_k"]["1"] == 1.0
     assert precise["evidence_location_rate"] == 1.0
-    assert broad_at_larger_scale["hit_at_k"]["3"] == 0.0
+    # The chunk index may return a target document's common context chunk for
+    # a broad query, but that is not evidence for the case-specific marker.
+    # Keep both signals visible: source-level hit is not evidence localization.
+    assert broad_at_larger_scale["hit_at_k"]["3"] == 0.5
+    assert broad_at_larger_scale["evidence_location_rate"] == 0.0
     assert report["runs"][1]["latency_ms"]["search"]["p95"] >= 0

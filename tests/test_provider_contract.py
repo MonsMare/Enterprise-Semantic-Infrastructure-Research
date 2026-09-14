@@ -106,3 +106,25 @@ def test_search_rejects_empty_query(provider):
 def test_page_size_has_a_hard_upper_bound(provider):
     with pytest.raises(KRLimitExceeded):
         provider.list(limit=201)
+
+
+def test_search_options_expose_hybrid_ranking_defaults():
+    options = SearchOptions()
+
+    assert options.semantic_weight == 0.35
+    assert options.rrf_k == 60
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"semantic_weight": -0.01},
+        {"semantic_weight": 1.01},
+        {"rrf_k": 0},
+        {"rrf_k": -1},
+        {"rrf_k": 1.5},
+    ],
+)
+def test_search_options_reject_invalid_hybrid_ranking_values(kwargs):
+    with pytest.raises(ValueError):
+        SearchOptions(**kwargs)

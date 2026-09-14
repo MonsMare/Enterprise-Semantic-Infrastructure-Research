@@ -6,20 +6,31 @@ from dataclasses import replace
 from typing import Any
 
 from .assets import KnowledgeAssetStore
-from .errors import KRInvalidLocator, KRNotFound
+from .errors import KRInvalidLocator, KRLimitExceeded, KRNotFound, KRStaleLocator
 from .memory_provider import MemoryProvider
-from .models import Evidence, SearchHit, SearchOptions
+from .models import Evidence, Locator, ReadOptions, SearchHit, SearchOptions, MAX_PAGE_SIZE
+from .retrieval import LocalNgramEncoder, SemanticEncoder, cosine_similarity, reciprocal_rank_fusion
 
 
 class AssetKnowledgeProvider(MemoryProvider):
     """Queryable view over persisted parsed assets, preserving source revisions."""
 
-    def __init__(self, store: KnowledgeAssetStore) -> None:
+    def __init__(
+        self,
+        store: KnowledgeAssetStore,
+        *,
+        semantic_encoder: SemanticEncoder | None = None,
+    ) -> None:
         self.store = store
+        self.semantic_encoder = semantic_encoder if semantic_encoder is not None else LocalNgramEncoder()
         self._assets = {}
         super().__init__({}, provider_id="knowledge-assets")
         if not hasattr(store, "search_current"):
             self.refresh()
+
+    @property
+    def descriptor(self):
+        return replace(super().descriptor, selector_types=("line", "section", "chunk"))
 
     def refresh(self) -> None:
         """Rebuild the query view from the store's current asset pointers."""
@@ -49,33 +60,93 @@ class AssetKnowledgeProvider(MemoryProvider):
         return super().find(*args, **kwargs)
 
     def search(self, *args, **kwargs):
-        if hasattr(self.store, "search_current"):
+        if hasattr(self.store, "search_chunks") and hasattr(self.store, "list_current_chunks"):
             query = args[0] if args else kwargs.get("query", "")
             scope = args[1] if len(args) > 1 else kwargs.get("scope")
             options = kwargs.get("options") or (args[2] if len(args) > 2 else None) or SearchOptions()
-            if scope:
-                self.refresh()
-                return super().search(*args, **kwargs)
+            lexical_candidates = self.store.search_chunks(
+                query,
+                scope=scope,
+                limit=MAX_PAGE_SIZE,
+            )
+            chunks = self.store.list_current_chunks(scope=scope)
             if options.case_sensitive:
-                self.refresh()
-                return super().search(*args, **kwargs)
-            assets = self.store.search_current(query)
-            hits = []
-            for asset in assets:
-                self._cache_asset(asset)
-                lines = asset.markdown.splitlines()
-                start, end = self._best_match_window(lines, query)
-                locator = self._locator(asset.asset_id, {"type": "line", "start": start, "end": max(start, end)})
-                hits.append(
-                    SearchHit(
-                        locator=locator,
-                        display_name=asset.source_name,
-                        preview="\n".join(lines[start - 1 : min(end, start + 2)])[:240] if lines else "",
-                        ordering_key=f"{asset.source_name.lower()}:{start:08d}",
+                terms = re.findall(r"\w+", query)
+
+                def has_case_sensitive_term(chunk) -> bool:
+                    searchable = " ".join((chunk.source_name, *chunk.heading_path, chunk.text))
+                    return any(
+                        re.search(rf"(?<!\w){re.escape(term)}(?!\w)", searchable)
+                        for term in terms
                     )
+
+                lexical_candidates = [
+                    item for item in lexical_candidates if has_case_sensitive_term(item[0])
+                ]
+                chunks = [chunk for chunk in chunks if has_case_sensitive_term(chunk)]
+
+            lexical_ranked = [
+                chunk
+                for chunk, _score in sorted(
+                    lexical_candidates,
+                    key=lambda item: (-item[1], item[0].chunk_id),
                 )
-            query_key = f"search::{query.casefold()}:{int(options.case_sensitive)}"
+            ]
+            query_vector = self.semantic_encoder.encode(query)
+
+            def searchable_text(chunk) -> str:
+                # Filename matching already contributes to the FTS channel;
+                # keep the local vector focused on the evidence and its headings.
+                return "\n".join((*chunk.heading_path, chunk.text))
+
+            semantic_candidates = [
+                (chunk, cosine_similarity(query_vector, self.semantic_encoder.encode(searchable_text(chunk))))
+                for chunk in chunks
+            ]
+            semantic_ranked = [
+                chunk
+                for chunk, score in sorted(
+                    (item for item in semantic_candidates if item[1] > 0.0),
+                    key=lambda item: (-item[1], item[0].chunk_id),
+                )[:MAX_PAGE_SIZE]
+            ]
+            ranked_chunks = reciprocal_rank_fusion(
+                lexical_ranked,
+                semantic_ranked,
+                key=lambda chunk: chunk.chunk_id,
+                semantic_weight=options.semantic_weight,
+                rrf_k=options.rrf_k,
+            )
+            hits = [
+                SearchHit(
+                    locator=Locator(
+                        version=1,
+                        provider=self.provider_id,
+                        resource_id=chunk.asset_id,
+                        revision=chunk.revision_id,
+                        selector={
+                            "type": "chunk",
+                            "id": chunk.chunk_id,
+                            "start": chunk.start_line,
+                            "end": chunk.end_line,
+                        },
+                    ),
+                    display_name=chunk.source_name,
+                    preview=chunk.text[:240],
+                    ordering_key=(
+                        f"{chunk.source_name.casefold()}:{chunk.start_line:08d}:{chunk.chunk_id}"
+                    ),
+                )
+                for chunk in ranked_chunks
+            ]
+            query_key = (
+                f"search:{scope or ''}:{query.casefold()}:{int(options.case_sensitive)}:"
+                f"{options.semantic_weight}:{options.rrf_k}"
+            )
             return self._page(hits, options.cursor, options.limit, query_key=query_key)
+        if hasattr(self.store, "search_current"):
+            self.refresh()
+            return super().search(*args, **kwargs)
         self.refresh()
         return super().search(*args, **kwargs)
 
@@ -86,6 +157,32 @@ class AssetKnowledgeProvider(MemoryProvider):
     def read(self, locator, options=None) -> Evidence:
         if locator.provider != self.provider_id:
             return super().read(locator, options)
+        if (
+            locator.selector
+            and locator.selector.get("type") == "chunk"
+            and hasattr(self.store, "list_current_chunks")
+        ):
+            options = options or ReadOptions()
+            if options.max_bytes > self.descriptor.max_read_bytes:
+                raise KRLimitExceeded(
+                    f"max_bytes cannot exceed provider limit {self.descriptor.max_read_bytes}"
+                )
+            asset, chunk = self._resolve_chunk(locator)
+            selected = chunk.text
+            encoded = selected.encode("utf-8")
+            truncated = len(encoded) > options.max_bytes
+            if truncated:
+                selected = encoded[: options.max_bytes].decode("utf-8", errors="ignore")
+            return Evidence.from_content(
+                locator=locator,
+                content=selected,
+                media_type="text/markdown",
+                representation=options.representation,
+                resolved_selector=locator.selector,
+                derived_from=asset.asset_id,
+                source_label=asset.source_name,
+                truncated=truncated,
+            )
         if hasattr(self.store, "search_current"):
             try:
                 self._cache_asset(self.store.get(locator.resource_id))
@@ -102,6 +199,31 @@ class AssetKnowledgeProvider(MemoryProvider):
     def stat(self, locator) -> dict[str, Any]:
         if locator.provider != self.provider_id:
             raise KRInvalidLocator("locator belongs to another provider")
+        if (
+            locator.selector
+            and locator.selector.get("type") == "chunk"
+            and hasattr(self.store, "list_current_chunks")
+        ):
+            asset, chunk = self._resolve_chunk(locator)
+            result = {
+                "provider": self.provider_id,
+                "resource_id": locator.resource_id,
+                "name": asset.source_name,
+                "revision": asset.revision_id or asset.source_hash,
+                "media_type": "text/markdown",
+                "size_bytes": len(chunk.text.encode("utf-8")),
+                "chunk_id": chunk.chunk_id,
+                "start_line": chunk.start_line,
+                "end_line": chunk.end_line,
+            }
+            result.update(
+                {
+                    "source_hash": asset.source_hash,
+                    "parser": asset.parser_name,
+                    "parser_version": asset.parser_version,
+                }
+            )
+            return result
         if hasattr(self.store, "search_current"):
             try:
                 self._cache_asset(self.store.get(locator.resource_id))
@@ -116,6 +238,39 @@ class AssetKnowledgeProvider(MemoryProvider):
         if asset:
             result.update({"source_hash": asset.source_hash, "parser": asset.parser_name, "parser_version": asset.parser_version})
         return result
+
+    def _resolve_chunk(self, locator) -> tuple[Any, Any]:
+        try:
+            asset = self.store.get(locator.resource_id)
+        except KRNotFound:
+            self._assets.pop(locator.resource_id, None)
+            self._resources.pop(locator.resource_id, None)
+            raise
+        self._cache_asset(asset)
+        current_revision = asset.revision_id or asset.source_hash
+        if locator.revision != current_revision:
+            raise KRStaleLocator(f"expected {locator.revision}, current {current_revision}")
+
+        selector = locator.selector or {}
+        chunk_id = selector.get("id")
+        chunk = next(
+            (
+                current
+                for current in self.store.list_current_chunks(asset_id=asset.asset_id)
+                if current.chunk_id == chunk_id
+            ),
+            None,
+        )
+        if chunk is None:
+            raise KRInvalidLocator("chunk selector does not identify a current chunk")
+        try:
+            start = int(selector["start"])
+            end = int(selector["end"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise KRInvalidLocator("chunk selector requires a valid line range") from exc
+        if start != chunk.start_line or end != chunk.end_line:
+            raise KRInvalidLocator("chunk selector range does not match the current chunk")
+        return asset, chunk
 
     def _cache_asset(self, asset) -> None:
         self._assets[asset.asset_id] = asset

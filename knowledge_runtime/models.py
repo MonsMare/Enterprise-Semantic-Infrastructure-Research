@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Generic, Mapping, Sequence, TypeVar
@@ -97,6 +98,8 @@ class SearchOptions:
     limit: int = 20
     cursor: str | None = None
     case_sensitive: bool = False
+    semantic_weight: float = 0.35
+    rrf_k: int = 60
 
     def __post_init__(self) -> None:
         if self.limit <= 0:
@@ -105,6 +108,15 @@ class SearchOptions:
             from .errors import KRLimitExceeded
 
             raise KRLimitExceeded(f"limit cannot exceed {MAX_PAGE_SIZE}")
+        if (
+            isinstance(self.semantic_weight, bool)
+            or not isinstance(self.semantic_weight, (int, float))
+            or not math.isfinite(self.semantic_weight)
+            or not 0.0 <= self.semantic_weight <= 1.0
+        ):
+            raise ValueError("semantic_weight must be between 0 and 1")
+        if isinstance(self.rrf_k, bool) or not isinstance(self.rrf_k, int) or self.rrf_k <= 0:
+            raise ValueError("rrf_k must be a positive integer")
 
 
 @dataclass(frozen=True)
