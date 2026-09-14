@@ -6,6 +6,8 @@ from knowledge_runtime.evaluation import (
     RetrievalBenchmarkRunner,
     load_cases,
 )
+from knowledge_runtime.assets import SQLiteKnowledgeAssetStore
+from knowledge_runtime.extractors import LocalExtractionBackend
 from knowledge_runtime.memory_provider import MemoryProvider
 
 
@@ -390,6 +392,86 @@ def test_retrieval_benchmark_checks_target_rank_and_source_bound_evidence():
     assert report.cases[0].expected_rank == 1
     assert report.cases[0].evidence_sources == ("gold.md",)
     assert report.cases[0].evidence_bytes > 0
+
+
+def test_retrieval_benchmark_evidence_rank_uses_global_hit_order_for_multiple_sources():
+    provider = MemoryProvider(
+        {
+            "a.md": "Alpha marker is supported here.",
+            "b.md": "Beta marker is supported here.",
+        }
+    )
+    report = RetrievalBenchmarkRunner().run(
+        [
+            BenchmarkCase(
+                case_id="multi-source-evidence",
+                question="Find both statements.",
+                expected_sources=("b.md", "a.md"),
+                required_evidence_phrases=("Alpha marker", "Beta marker"),
+                retrieval_query="marker",
+            )
+        ],
+        provider,
+    )
+
+    result = report.cases[0]
+    assert result.passed
+    assert result.expected_rank == 2
+    assert result.expected_chunk_rank == 2
+    assert result.evidence_rank == 2
+
+
+def test_retrieval_benchmark_excludes_source_only_cases_from_gold_evidence_metrics():
+    provider = MemoryProvider({"source.md": "A document with no gold phrase annotation."})
+    report = RetrievalBenchmarkRunner().run(
+        [
+            BenchmarkCase(
+                case_id="source-only",
+                question="Find the document.",
+                expected_sources=("source.md",),
+                retrieval_query="document",
+            )
+        ],
+        provider,
+    )
+
+    assert report.cases[0].evidence_rank is None
+    assert report.as_dict()["evidence_metrics"]["cases"] == 0
+
+
+def test_retrieval_benchmark_reads_multiple_target_chunks_until_gold_is_covered(tmp_path):
+    source = tmp_path / "policy.md"
+    source.write_text(
+        "# Policy\n\nFirst rule is documented.\n\n"
+        "Second rule is documented.\n",
+        encoding="utf-8",
+    )
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+    LocalExtractionBackend().extract(source, store=store)
+    from knowledge_runtime.asset_provider import AssetKnowledgeProvider
+
+    report = RetrievalBenchmarkRunner().run(
+        [
+            BenchmarkCase(
+                case_id="multi-chunk-gold",
+                question="What are the two rules?",
+                expected_sources=(source.name,),
+                required_evidence_phrases=("First rule is documented", "Second rule is documented"),
+                retrieval_query="rule documented",
+            )
+        ],
+        AssetKnowledgeProvider(store),
+        limit=10,
+    )
+
+    assert report.passed == 1
+    assert report.cases[0].evidence_sources == (source.name, source.name)
+    assert report.cases[0].expected_rank == 1
+    assert report.cases[0].expected_chunk_rank == 1
+    assert report.cases[0].evidence_rank == 2
+    assert report.as_dict()["evidence_metrics"]["hit_at_1"] == 0.0
+    assert report.as_dict()["evidence_metrics"]["hit_at_3"] == 1.0
+    store.close()
 
 
 def test_retrieval_benchmark_reports_missing_gold_evidence():

@@ -474,6 +474,9 @@ class RetrievalCaseResult:
     failures: tuple[str, ...]
     retrieval_query: str
     expected_rank: int | None
+    expected_chunk_rank: int | None
+    evidence_rank: int | None
+    evidence_ranking_applicable: bool
     retrieved_sources: tuple[str, ...]
     evidence_sources: tuple[str, ...]
     evidence_bytes: int
@@ -502,6 +505,10 @@ class RetrievalBenchmarkReport:
         return [case for case in self.cases if case.ranking_applicable]
 
     @property
+    def evidence_ranking_cases(self) -> list[RetrievalCaseResult]:
+        return [case for case in self.ranking_cases if case.evidence_ranking_applicable]
+
+    @property
     def hit_at_1(self) -> float | None:
         cases = self.ranking_cases
         return sum(case.expected_rank == 1 for case in cases) / len(cases) if cases else None
@@ -519,6 +526,25 @@ class RetrievalBenchmarkReport:
         if not cases:
             return None
         return sum(1 / case.expected_rank if case.expected_rank else 0 for case in cases) / len(cases)
+
+    @property
+    def evidence_hit_at_1(self) -> float | None:
+        cases = self.evidence_ranking_cases
+        return sum(case.evidence_rank == 1 for case in cases) / len(cases) if cases else None
+
+    @property
+    def evidence_hit_at_3(self) -> float | None:
+        cases = self.evidence_ranking_cases
+        if not cases:
+            return None
+        return sum(case.evidence_rank is not None and case.evidence_rank <= 3 for case in cases) / len(cases)
+
+    @property
+    def evidence_mean_reciprocal_rank(self) -> float | None:
+        cases = self.evidence_ranking_cases
+        if not cases:
+            return None
+        return sum(1 / case.evidence_rank if case.evidence_rank else 0 for case in cases) / len(cases)
 
     def as_dict(self) -> dict[str, Any]:
         by_query_style: dict[str, dict[str, Any]] = {}
@@ -552,6 +578,18 @@ class RetrievalBenchmarkReport:
                 "hit_at_1": self.hit_at_1,
                 "hit_at_3": self.hit_at_3,
                 "mrr": self.mean_reciprocal_rank,
+            },
+            "evidence_metrics": {
+                "cases": len(self.evidence_ranking_cases),
+                "hit_at_1": self.evidence_hit_at_1,
+                "hit_at_3": self.evidence_hit_at_3,
+                "mrr": self.evidence_mean_reciprocal_rank,
+                "evidence_location_rate": (
+                    sum(case.evidence_rank is not None for case in self.evidence_ranking_cases)
+                    / len(self.evidence_ranking_cases)
+                    if self.evidence_ranking_cases
+                    else None
+                ),
             },
             "query_style_metrics": by_query_style,
             "runtime_metrics": {
@@ -599,24 +637,33 @@ class RetrievalBenchmarkRunner:
         search_started = time.perf_counter()
         page = provider.search(query, options=SearchOptions(limit=limit))
         search_ms = (time.perf_counter() - search_started) * 1000
-        retrieved_sources = tuple(hit.display_name for hit in page.items)
+        source_ranks: dict[str, int] = {}
+        for hit in page.items:
+            normalized_name = hit.display_name.casefold()
+            if normalized_name not in source_ranks:
+                source_ranks[normalized_name] = len(source_ranks) + 1
+        retrieved_sources = tuple(dict.fromkeys(hit.display_name for hit in page.items))
         failures: list[str] = []
         expected_hits = []
         target_ranks: list[int] = []
+        target_chunk_ranks: list[int] = []
         for expected in case.expected_sources:
-            match = next(
-                (
-                    (rank, hit)
-                    for rank, hit in enumerate(page.items, 1)
-                    if hit.display_name.casefold() == expected.casefold()
-                ),
-                None,
-            )
-            if match is None:
+            matches = [
+                (rank, hit)
+                for rank, hit in enumerate(page.items, 1)
+                if hit.display_name.casefold() == expected.casefold()
+            ]
+            if not matches:
                 failures.append(f"expected source was not retrieved: {expected}")
             else:
-                target_ranks.append(match[0])
-                expected_hits.append(match[1])
+                # A chunk-first provider can return several evidence chunks for
+                # one source. Keep the first rank as the source-level ranking
+                # signal, then read additional chunks only when the gold
+                # evidence spans them.
+                target_ranks.append(source_ranks.get(expected.casefold(), matches[0][0]))
+                target_chunk_ranks.append(matches[0][0])
+                expected_hits.extend(matches)
+        expected_hits.sort(key=lambda item: item[0])
         if case.answerable and not expected_hits:
             failures.append("answerable case produced no target source evidence")
         if not case.answerable and page.items:
@@ -636,7 +683,15 @@ class RetrievalBenchmarkRunner:
         evidence = []
         read_ms = 0.0
         evidence_bytes = 0
-        for hit in expected_hits:
+        evidence_rank: int | None = None
+        evidence_ranking_applicable = bool(case.required_evidence_phrases or case.required_claims)
+        seen_locators: set[str] = set()
+        expected_source_names = {source.casefold() for source in case.expected_sources}
+        for rank, hit in expected_hits:
+            locator_key = hit.locator.to_json()
+            if locator_key in seen_locators:
+                continue
+            seen_locators.add(locator_key)
             read_started = time.perf_counter()
             try:
                 item = provider.read(hit.locator, ReadOptions(max_bytes=max_read_bytes))
@@ -646,6 +701,14 @@ class RetrievalBenchmarkRunner:
                 failures.append(f"could not read expected source {hit.display_name}: {exc}")
             finally:
                 read_ms += (time.perf_counter() - read_started) * 1000
+            if _evidence_requirements_satisfied(
+                evidence,
+                case,
+                expected_source_names=expected_source_names,
+            ):
+                if evidence_ranking_applicable:
+                    evidence_rank = rank
+                break
         evidence_text = "\n".join(str(item.content) for item in evidence).casefold()
         evidence_text = re.sub(r"(?<=\w)-\s*\n\s*(?=\w)", "", evidence_text)
         evidence_text = " ".join(evidence_text.split())
@@ -670,6 +733,13 @@ class RetrievalBenchmarkRunner:
             failures=tuple(failures),
             retrieval_query=query,
             expected_rank=max(target_ranks) if case.expected_sources and len(target_ranks) == len(case.expected_sources) else None,
+            expected_chunk_rank=(
+                max(target_chunk_ranks)
+                if case.expected_sources and len(target_chunk_ranks) == len(case.expected_sources)
+                else None
+            ),
+            evidence_rank=evidence_rank,
+            evidence_ranking_applicable=evidence_ranking_applicable,
             retrieved_sources=retrieved_sources,
             evidence_sources=evidence_sources,
             evidence_bytes=evidence_bytes,
@@ -710,6 +780,34 @@ def _phrase_in_text(phrase: str, text: str) -> bool:
         r"\s*".join(re.escape(char) for char in word) for word in words
     )
     return re.search(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", str(text).casefold()) is not None
+
+
+def _evidence_requirements_satisfied(
+    evidence: list[Any],
+    case: BenchmarkCase,
+    *,
+    expected_source_names: set[str],
+) -> bool:
+    """Stop chunk reads once all expected sources and gold evidence are present."""
+    present_sources = {
+        (item.source_label or item.locator.resource_id).casefold()
+        for item in evidence
+        if item.source_label or item.locator.resource_id
+    }
+    if any(
+        not any(expected in source for source in present_sources)
+        for expected in expected_source_names
+    ):
+        return False
+    evidence_text = "\n".join(str(item.content) for item in evidence).casefold()
+    evidence_text = re.sub(r"(?<=\w)-\s*\n\s*(?=\w)", "", evidence_text)
+    evidence_text = " ".join(evidence_text.split())
+    if any(not _phrase_in_text(phrase, evidence_text) for phrase in case.required_evidence_phrases):
+        return False
+    return all(
+        any(_phrase_in_text(phrase, evidence_text) for phrase in claim.evidence_phrases)
+        for claim in case.required_claims
+    )
 
 
 def _query_anchor_coverage(query: str, groups: tuple[tuple[str, ...], ...]) -> float:
