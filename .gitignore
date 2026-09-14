@@ -1,0 +1,7 @@
+.env
+.kr-data/
+.test-tmp/
+__pycache__/
+.pytest_cache/
+.superpowers/
+*.py[cod]
