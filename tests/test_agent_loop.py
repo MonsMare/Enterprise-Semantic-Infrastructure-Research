@@ -88,3 +88,84 @@ def test_agent_explains_compact_and_multi_part_search_strategy_to_model():
     assert "2 to 5" in system_instructions
     assert "separate targeted searches" in system_instructions
     assert "2 to 5" in search_tool["description"]
+
+
+def test_agent_records_the_exact_search_query_for_benchmark_auditing():
+    provider = MemoryProvider({"guide.md": "Data supplied by others must be reviewed."})
+    model = ScriptedModel(
+        [
+            {"tool_calls": [tool_call("search", {"query": "third-party data review"})]},
+            {"content": "I found no need to read yet."},
+        ]
+    )
+
+    result = AgentLoop(model).run("别人给的数据要怎么处理？", provider)
+
+    search_event = next(event for event in result.events if event.kind == "tool_result")
+    assert search_event.payload["query"] == "third-party data review"
+
+
+def test_agent_loop_resolves_model_friendly_document_line_locator():
+    provider = MemoryProvider({"guide.md": "The answer is in the first line."})
+    model = ScriptedModel(
+        [
+            {"tool_calls": [tool_call("read", {"locator": "guide.md:00000001"})]},
+            {"content": "The answer is in the first line."},
+        ]
+    )
+
+    result = AgentLoop(model).run("What is the answer?", provider)
+
+    assert len(result.evidence) == 1
+    assert "first line" in result.evidence[0].content
+
+
+def test_agent_loop_forces_answer_after_relevant_evidence():
+    provider = MemoryProvider({"guide.md": "The access token expires after one hour."})
+    locator = provider.list(limit=1).items[0].locator
+    model = ScriptedModel(
+        [
+            {"tool_calls": [tool_call("read", {"locator": locator.to_json()})]},
+            {"content": "The access token expires after one hour. [ev-placeholder]"},
+        ]
+    )
+
+    result = AgentLoop(model).run("access token", provider)
+
+    assert result.stopped_reason == "completed"
+    assert len(model.calls[1][1]) == 0
+
+
+def test_agent_loop_asks_for_context_for_pronoun_only_fragment():
+    provider = MemoryProvider({"guide.md": "There are four options."})
+    model = ScriptedModel([])
+
+    result = AgentLoop(model).run("那四种？", provider)
+
+    assert result.stopped_reason == "clarification_needed"
+    assert result.evidence == []
+    assert model.calls == []
+    assert "补充" in result.answer
+
+
+def test_agent_loop_records_malformed_tool_arguments_without_unbound_local_error():
+    provider = MemoryProvider({"guide.md": "A factual statement."})
+    model = ScriptedModel(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "bad-args",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{"},
+                    }
+                ]
+            },
+            {"content": "No answer."},
+        ]
+    )
+
+    result = AgentLoop(model).run("What is the answer?", provider)
+
+    assert any(event.kind == "tool_error" for event in result.events)
+    assert result.stopped_reason == "no_evidence"

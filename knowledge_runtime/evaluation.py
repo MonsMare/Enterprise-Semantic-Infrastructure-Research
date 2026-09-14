@@ -14,6 +14,14 @@ from .provider import KnowledgeProvider
 
 
 @dataclass(frozen=True)
+class BenchmarkClaim:
+    """A human-gold answer concept paired with phrases that support it in Evidence."""
+
+    answer_phrases: tuple[str, ...]
+    evidence_phrases: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class BenchmarkCase:
     """A small, auditable case definition for KR retrieval and grounding tests."""
 
@@ -25,6 +33,16 @@ class BenchmarkCase:
     must_cite: bool = True
     required_evidence_phrases: tuple[str, ...] = ()
     retrieval_query: str | None = None
+    query_style: str | None = None
+    query_anchor_groups: tuple[tuple[str, ...], ...] = ()
+    retrieval_max_expected_rank: int | None = None
+    required_claims: tuple[BenchmarkClaim, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.retrieval_max_expected_rank is not None and self.retrieval_max_expected_rank <= 0:
+            raise ValueError("retrieval_max_expected_rank must be positive")
+        if any(not claim.answer_phrases or not claim.evidence_phrases for claim in self.required_claims):
+            raise ValueError("each required claim needs answer and evidence phrases")
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "BenchmarkCase":
@@ -39,6 +57,23 @@ class BenchmarkCase:
             answerable=bool(value.get("answerable", True)),
             must_cite=bool(value.get("must_cite", True)),
             retrieval_query=(str(value["retrieval_query"]) if value.get("retrieval_query") else None),
+            query_style=(str(value["query_style"]) if value.get("query_style") else None),
+            query_anchor_groups=tuple(
+                tuple(str(alias) for alias in group)
+                for group in value.get("query_anchor_groups", [])
+            ),
+            retrieval_max_expected_rank=(
+                int(value["retrieval_max_expected_rank"])
+                if value.get("retrieval_max_expected_rank") is not None
+                else None
+            ),
+            required_claims=tuple(
+                BenchmarkClaim(
+                    answer_phrases=tuple(str(phrase) for phrase in claim.get("answer_phrases", [])),
+                    evidence_phrases=tuple(str(phrase) for phrase in claim.get("evidence_phrases", [])),
+                )
+                for claim in value.get("required_claims", [])
+            ),
         )
 
 
@@ -60,6 +95,11 @@ class BenchmarkCaseResult:
     ranking_applicable: bool
     expected_rank: int | None
     retrieved_sources: tuple[str, ...]
+    query_style: str | None
+    search_queries: tuple[str, ...]
+    first_expected_rank: int | None
+    first_query_anchor_coverage: float | None
+    best_query_anchor_coverage: float | None
 
 
 @dataclass(frozen=True)
@@ -101,6 +141,23 @@ class BenchmarkReport:
         reciprocal_ranks = [1 / case.expected_rank if case.expected_rank else 0 for case in cases]
         return sum(reciprocal_ranks) / len(cases)
 
+    @property
+    def first_search_hit_at_1(self) -> float | None:
+        cases = self.ranking_cases
+        if not cases:
+            return None
+        return sum(case.first_expected_rank == 1 for case in cases) / len(cases)
+
+    @property
+    def first_search_hit_at_3(self) -> float | None:
+        cases = self.ranking_cases
+        if not cases:
+            return None
+        return sum(
+            case.first_expected_rank is not None and case.first_expected_rank <= 3
+            for case in cases
+        ) / len(cases)
+
     @staticmethod
     def _percentile(values: list[float], percentile: float) -> float | None:
         if not values:
@@ -110,6 +167,50 @@ class BenchmarkReport:
         return round(ordered[index], 3)
 
     def as_dict(self) -> dict[str, Any]:
+        query_gold_cases = [
+            case for case in self.cases if case.first_query_anchor_coverage is not None
+        ]
+        by_query_style: dict[str, dict[str, Any]] = {}
+        styles = sorted({case.query_style for case in self.cases if case.query_style})
+        for style in styles:
+            style_cases = [case for case in self.cases if case.query_style == style]
+            ranked = [case for case in style_cases if case.ranking_applicable]
+            anchored = [case for case in style_cases if case.first_query_anchor_coverage is not None]
+            by_query_style[style] = {
+                "cases": len(style_cases),
+                "pass_rate": sum(case.passed for case in style_cases) / len(style_cases),
+                "first_search_hit_at_1": (
+                    sum(case.first_expected_rank == 1 for case in ranked) / len(ranked)
+                    if ranked
+                    else None
+                ),
+                "first_search_hit_at_3": (
+                    sum(
+                        case.first_expected_rank is not None and case.first_expected_rank <= 3
+                        for case in ranked
+                    ) / len(ranked)
+                    if ranked
+                    else None
+                ),
+                "mean_first_query_anchor_coverage": (
+                    round(
+                        sum(case.first_query_anchor_coverage or 0.0 for case in anchored)
+                        / len(anchored),
+                        6,
+                    )
+                    if anchored
+                    else None
+                ),
+                "mean_best_query_anchor_coverage": (
+                    round(
+                        sum(case.best_query_anchor_coverage or 0.0 for case in anchored)
+                        / len(anchored),
+                        6,
+                    )
+                    if anchored
+                    else None
+                ),
+            }
         return {
             "model": self.model,
             "passed": self.passed,
@@ -119,6 +220,35 @@ class BenchmarkReport:
                 "hit_at_1": self.hit_at_1,
                 "hit_at_3": self.hit_at_3,
                 "mrr": self.mean_reciprocal_rank,
+                "first_search_hit_at_1": self.first_search_hit_at_1,
+                "first_search_hit_at_3": self.first_search_hit_at_3,
+            },
+            "agent_query_metrics": {
+                "cases_with_query_gold": len(query_gold_cases),
+                "mean_first_query_anchor_coverage": (
+                    round(
+                        sum(case.first_query_anchor_coverage or 0.0 for case in query_gold_cases)
+                        / len(query_gold_cases),
+                        6,
+                    )
+                    if query_gold_cases
+                    else None
+                ),
+                "mean_best_query_anchor_coverage": (
+                    round(
+                        sum(case.best_query_anchor_coverage or 0.0 for case in query_gold_cases)
+                        / len(query_gold_cases),
+                        6,
+                    )
+                    if query_gold_cases
+                    else None
+                ),
+                "mean_searches_per_case": (
+                    round(sum(len(case.search_queries) for case in self.cases) / len(self.cases), 3)
+                    if self.cases
+                    else None
+                ),
+                "by_query_style": by_query_style,
             },
             "runtime_metrics": {
                 "e2e_p50_ms": self._percentile([case.elapsed_ms for case in self.cases], 0.50),
@@ -210,7 +340,7 @@ class BenchmarkRunner:
         for phrase in case.required_phrases:
             if phrase.casefold() not in result.answer.casefold():
                 failures.append(f"required phrase missing: {phrase}")
-            if phrase.casefold() not in expected_evidence_text:
+            if not _phrase_in_text(phrase, expected_evidence_text):
                 failures.append(f"required answer phrase unsupported by expected source: {phrase}")
             answer_sentence = next(
                 (
@@ -226,13 +356,42 @@ class BenchmarkRunner:
                 failures.append(f"required answer phrase lacks a local Evidence citation: {phrase}")
         for phrase in case.required_evidence_phrases:
             normalized_phrase = " ".join(phrase.casefold().split())
-            if normalized_phrase not in expected_evidence_text:
+            if not _phrase_in_text(normalized_phrase, expected_evidence_text):
                 failures.append(f"required evidence phrase missing from expected source: {phrase}")
+        for claim in case.required_claims:
+            answer_phrase = next(
+                (
+                    phrase
+                    for phrase in claim.answer_phrases
+                    if phrase.casefold() in result.answer.casefold()
+                ),
+                None,
+            )
+            claim_label = " | ".join(claim.answer_phrases)
+            if answer_phrase is None:
+                failures.append(f"required answer claim missing: {claim_label}")
+            elif case.must_cite:
+                answer_sentence = next(
+                    (
+                        sentence
+                        for sentence in re.split(
+                            r"(?<=[.!?。！？])\s+(?!\[ev-)|\n+", result.answer
+                        )
+                        if answer_phrase.casefold() in sentence.casefold()
+                    ),
+                    "",
+                )
+                if not re.search(r"\[ev-[^\]]+\]", answer_sentence):
+                    failures.append(f"required answer claim lacks a local Evidence citation: {claim_label}")
+            if not any(
+                _phrase_in_text(phrase, expected_evidence_text)
+                for phrase in claim.evidence_phrases
+            ):
+                failures.append(f"required answer claim unsupported by expected source: {claim_label}")
         if case.must_cite and result.evidence and not any(
             evidence.evidence_id in result.answer for evidence in result.evidence
         ):
             failures.append("answer does not cite a read Evidence ID")
-        tool_results = [event.payload for event in result.events if event.kind == "tool_result"]
         tool_events = [
             event.payload
             for event in result.events
@@ -240,8 +399,15 @@ class BenchmarkRunner:
         ]
         retrieved_sources: list[str] = []
         expected_ranks: list[int] = []
-        for event in tool_results:
-            if event.get("tool") != "search":
+        search_events = [event for event in tool_events if event.get("tool") == "search"]
+        search_queries = tuple(
+            query
+            for event in search_events
+            if isinstance((query := event.get("query")), str) and query.strip()
+        )
+        first_expected_rank: int | None = None
+        for event_index, event in enumerate(search_events):
+            if event.get("result") is None:
                 continue
             page = event.get("result") or {}
             page_sources: list[str] = []
@@ -251,17 +417,24 @@ class BenchmarkRunner:
                     retrieved_sources.append(name)
                 if name:
                     page_sources.append(name)
-            page_rank = next(
-                (
-                    index
-                    for index, source in enumerate(page_sources, 1)
-                    if any(expected.casefold() == source.casefold() for expected in case.expected_sources)
-                ),
-                None,
-            )
+            page_rank = _expected_source_rank(page_sources, case.expected_sources)
+            if first_expected_rank is None:
+                first_expected_rank = page_rank
             if page_rank is not None:
                 expected_ranks.append(page_rank)
         expected_rank = min(expected_ranks) if expected_ranks else None
+        query_coverages = [
+            _query_anchor_coverage(query, case.query_anchor_groups)
+            for query in search_queries
+        ]
+        if case.query_anchor_groups and not query_coverages:
+            query_coverages = [0.0]
+        first_query_anchor_coverage = (
+            query_coverages[0] if case.query_anchor_groups else None
+        )
+        best_query_anchor_coverage = (
+            max(query_coverages) if case.query_anchor_groups else None
+        )
         search_ms = sum(
             float(event.get("duration_ms", 0)) for event in tool_events if event.get("tool") == "search"
         )
@@ -286,6 +459,11 @@ class BenchmarkRunner:
             ranking_applicable=bool(case.expected_sources),
             expected_rank=expected_rank,
             retrieved_sources=tuple(retrieved_sources),
+            query_style=case.query_style,
+            search_queries=search_queries,
+            first_expected_rank=first_expected_rank,
+            first_query_anchor_coverage=first_query_anchor_coverage,
+            best_query_anchor_coverage=best_query_anchor_coverage,
         )
 
 
@@ -303,6 +481,8 @@ class RetrievalCaseResult:
     search_ms: float
     read_ms: float
     ranking_applicable: bool
+    query_style: str | None
+    retrieval_max_expected_rank: int | None
 
 
 @dataclass(frozen=True)
@@ -341,6 +521,28 @@ class RetrievalBenchmarkReport:
         return sum(1 / case.expected_rank if case.expected_rank else 0 for case in cases) / len(cases)
 
     def as_dict(self) -> dict[str, Any]:
+        by_query_style: dict[str, dict[str, Any]] = {}
+        styles = sorted({case.query_style for case in self.cases if case.query_style})
+        for style in styles:
+            style_cases = [case for case in self.cases if case.query_style == style]
+            ranked = [case for case in style_cases if case.ranking_applicable]
+            by_query_style[style] = {
+                "cases": len(style_cases),
+                "pass_rate": sum(case.passed for case in style_cases) / len(style_cases),
+                "hit_at_1": (
+                    sum(case.expected_rank == 1 for case in ranked) / len(ranked)
+                    if ranked
+                    else None
+                ),
+                "hit_at_3": (
+                    sum(
+                        case.expected_rank is not None and case.expected_rank <= 3
+                        for case in ranked
+                    ) / len(ranked)
+                    if ranked
+                    else None
+                ),
+            }
         return {
             "pipeline": "retrieval-only",
             "passed": self.passed,
@@ -351,6 +553,7 @@ class RetrievalBenchmarkReport:
                 "hit_at_3": self.hit_at_3,
                 "mrr": self.mean_reciprocal_rank,
             },
+            "query_style_metrics": by_query_style,
             "runtime_metrics": {
                 "e2e_p50_ms": BenchmarkReport._percentile(
                     [case.elapsed_ms for case in self.cases], 0.50
@@ -419,6 +622,17 @@ class RetrievalBenchmarkRunner:
         if not case.answerable and page.items:
             failures.append("unanswerable case retrieved candidate sources")
 
+        expected_rank = max(target_ranks) if target_ranks else None
+        if (
+            case.retrieval_max_expected_rank is not None
+            and expected_rank is not None
+            and expected_rank > case.retrieval_max_expected_rank
+        ):
+            failures.append(
+                f"expected source rank {expected_rank} exceeds maximum allowed rank "
+                f"{case.retrieval_max_expected_rank}"
+            )
+
         evidence = []
         read_ms = 0.0
         evidence_bytes = 0
@@ -436,8 +650,17 @@ class RetrievalBenchmarkRunner:
         evidence_text = re.sub(r"(?<=\w)-\s*\n\s*(?=\w)", "", evidence_text)
         evidence_text = " ".join(evidence_text.split())
         for phrase in case.required_evidence_phrases:
-            if " ".join(phrase.casefold().split()) not in evidence_text:
+            if not _phrase_in_text(phrase, evidence_text):
                 failures.append(f"required evidence phrase missing from expected source: {phrase}")
+        for claim in case.required_claims:
+            if not any(
+                _phrase_in_text(phrase, evidence_text)
+                for phrase in claim.evidence_phrases
+            ):
+                failures.append(
+                    "required answer claim unsupported by expected source: "
+                    + " | ".join(claim.answer_phrases)
+                )
         evidence_sources = tuple(
             item.source_label or item.locator.resource_id for item in evidence
         )
@@ -454,6 +677,8 @@ class RetrievalBenchmarkRunner:
             search_ms=round(search_ms, 3),
             read_ms=round(read_ms, 3),
             ranking_applicable=bool(case.expected_sources),
+            query_style=case.query_style,
+            retrieval_max_expected_rank=case.retrieval_max_expected_rank,
         )
 
 
@@ -463,3 +688,41 @@ def write_report(report: BenchmarkReport, path: str | Path) -> None:
 
 def write_retrieval_report(report: RetrievalBenchmarkReport, path: str | Path) -> None:
     Path(path).write_text(json.dumps(report.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _expected_source_rank(sources: list[str], expected_sources: tuple[str, ...]) -> int | None:
+    return next(
+        (
+            index
+            for index, source in enumerate(sources, 1)
+            if any(expected.casefold() == source.casefold() for expected in expected_sources)
+        ),
+        None,
+    )
+
+
+def _phrase_in_text(phrase: str, text: str) -> bool:
+    """Match source phrases across PDF/OCR word-splitting artifacts."""
+    words = re.findall(r"\S+", str(phrase).casefold())
+    if not words:
+        return True
+    pattern = r"\s+".join(
+        r"\s*".join(re.escape(char) for char in word) for word in words
+    )
+    return re.search(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", str(text).casefold()) is not None
+
+
+def _query_anchor_coverage(query: str, groups: tuple[tuple[str, ...], ...]) -> float:
+    if not groups:
+        return 0.0
+    normalized_query = " ".join(re.findall(r"\w+", query.casefold()))
+    padded_query = f" {normalized_query} "
+    matched = 0
+    for aliases in groups:
+        if any(
+            (normalized_alias := " ".join(re.findall(r"\w+", alias.casefold())))
+            and f" {normalized_alias} " in padded_query
+            for alias in aliases
+        ):
+            matched += 1
+    return matched / len(groups)

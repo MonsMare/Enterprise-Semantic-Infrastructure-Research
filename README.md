@@ -43,7 +43,7 @@ python -m knowledge_runtime.cli ask "恢复码多久过期？" --model qwen3.8-m
 
 Agent Loop 最多执行 8 次模型请求，单轮累计读取默认限制为 20 KB。回答必须引用 Read 产生的 Evidence ID；没有读取到 Evidence 时会拒答。可以通过 `--max-iterations` 与 `--max-read-bytes` 调整 POC 限制。
 
-当前 lexical search 使用不区分大小写的字面子串匹配；`find` 按名称子串或 glob 模式匹配，`scope` 是资源 ID 的路径前缀。Search 顺序按资源名称与命中行稳定排序，分页游标绑定查询和结果 snapshot。
+Memory Provider 的 lexical search 使用不区分大小写的字面子串匹配；SQLite 资产库使用 FTS5 的词项检索并按相关性排序。`find` 按名称子串或 glob 模式匹配，`scope` 是资源 ID 的路径前缀。Search 顺序和分页游标都绑定当前查询 snapshot。
 
 ## 数据库存储与 benchmark
 
@@ -61,6 +61,23 @@ SQLite 会事务化保存当前资产、每次 source revision、解析器 prove
 精算公开文档目录位于 `benchmarks/actuarial/public_sources.jsonl`，涵盖 ASB、CAS、SOA、NAIC、EIOPA 和 GAD。目录保存官方来源地址和评测元数据；下载清单记录来源、抓取时间和 SHA-256。文档保存在 `.kr-data/`，不会进入 Git。下载前应核对来源机构的许可和使用条款。
 
 Benchmark JSONL 按预期来源、回答关键短语和 Evidence 必含原文短语评分。报告包含 Hit@1、Hit@3、MRR、端到端 p50/p95、search/read 用时和 Evidence 字节数。要跑真实 Qwen 评测，需先在本机设置 `LLM_API_KEY`；测试套件使用 ScriptedModel，不会发起模型 API 调用。
+
+模糊、简短和不完整的用户表达使用独立数据集验证：
+
+```powershell
+python -m knowledge_runtime.cli benchmark-retrieval .\benchmarks\actuarial\questions-fuzzy.jsonl --store .kr-data\actuarial.db --output .kr-data\actuarial-fuzzy-retrieval-report.json
+python -m knowledge_runtime.cli benchmark .\benchmarks\actuarial\questions-fuzzy.jsonl --store .kr-data\actuarial.db --model qwen3.8-max --output .kr-data\actuarial-fuzzy-agent-report.json
+```
+
+其中 `benchmark-retrieval` 测试“原始弱查询直接交给 KR”时能否命中，真实 Agent benchmark 另外记录 Agent 发出的每个 search query、首次命中排名和查询锚点覆盖率，从而区分“KR 检索能力”和“Agent 查询改写能力”。`ambiguous` 与 `underspecified` 用例要求没有上下文时不生成有依据的答案。
+
+语料规模实验使用真实 SQLite FTS → Locator → Read → Evidence 路径，不调用 LLM：
+
+```powershell
+python -m benchmarks.scale.run_scale_benchmark --sizes 20,100,1000,5000 --case-count 20 --top-k 20 --output .kr-data/scale-benchmark-report.json
+```
+
+它同时测量文档数量、Markdown/SQLite 字节数、Search/Read p50/p95、Hit@1/3/5/10/20、MRR 和 Evidence 原文定位率，并将精确查询与宽泛查询分开；宽泛查询命中下降表示查询区分度不足，不能单独解释为解析失败。
 
 ## 检查
 

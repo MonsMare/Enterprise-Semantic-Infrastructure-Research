@@ -47,3 +47,36 @@ The retrieval-only run does not call an LLM. It verifies source rank, reads the
 expected source, checks evidence phrases, and records latency and evidence size.
 The separate `benchmark` command runs the Qwen 3.8 Agent Retrieval Loop when
 `LLM_API_KEY` is configured.
+
+## 模糊问法与弱查询评测
+
+`questions-fuzzy.jsonl` 收录了中文口语化、简短、多语言和上下文不足的精算问题。
+`benchmark` 会把原始问题交给 Agent，再记录它实际发出的每条搜索语句、首轮与最佳
+来源排名、是否读取到金标准来源、回答是否包含金标准短语，以及 Evidence 引用情况。
+该命令固定使用 Qwen 3.8，并需要配置 `LLM_API_KEY`：
+
+```powershell
+python -m knowledge_runtime.cli benchmark .\benchmarks\actuarial\questions-fuzzy.jsonl --store .kr-data\actuarial.db --model qwen3.8-max --output .kr-data\actuarial-fuzzy-agent-report.json
+```
+
+`weak_query_probes.jsonl` 则是 KR-only 的直接检索压力样例。`benchmark-retrieval`
+跳过 Agent，把 `data`、`estimate`、`models` 等刻意压缩的查询原样交给 KR，从而区分
+“Agent 是否改写成功”和“KR 面对弱查询本身的排序及证据定位能力”。
+`retrieval_max_expected_rank` 是每条弱查询的人工排名门槛：
+
+```powershell
+python -m knowledge_runtime.cli benchmark-retrieval .\benchmarks\actuarial\weak_query_probes.jsonl --store .kr-data\actuarial.db --output .kr-data\actuarial-weak-query-report.json
+```
+
+`query_anchor_groups` 是 fuzzy Agent 测试中的人工标注关键概念及可接受同义词。Agent 查询锚点覆盖率衡量
+改写是否保留问题中的核心概念；它是可解释的诊断指标，不代替真实检索结果。报告按
+`query_style` 分组显示首轮 Hit@1/3、查询锚点覆盖率和通过率；同时应对比首轮与最佳
+排名、搜索次数、端到端通过率。检索是否有效最终以找到正确来源、读取到支持答案的
+Evidence、回答引用该 Evidence 为准。弱查询排名门槛失败是有意义的测量结果，表示
+需要 Agent 改写或改善 KR 的语义检索能力，不应为了让整个报告变绿而放宽门槛。
+
+对于中文问题，使用 `required_claims` 将可接受的中英文答案短语与来源中的支持短语
+逐条配对；这样答案语言可以跟随用户，而证据核验仍对照原文。
+
+To measure how SQLite search latency, Hit@k/MRR, and Evidence localization
+change as synthetic corpus size increases, see [the scale benchmark](../scale/README.md).

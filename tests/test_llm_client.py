@@ -37,6 +37,7 @@ def test_client_uses_compatible_chat_completions_and_configured_model(monkeypatc
 
     assert captured["url"] == "https://example.test/compatible/v1/chat/completions"
     assert captured["body"]["model"] == "qwen3.8-max"
+    assert captured["body"]["tool_choice"] == "none"
     assert captured["headers"]["Authorization"] == "Bearer test-only-secret"
     assert turn.content == "ok"
 

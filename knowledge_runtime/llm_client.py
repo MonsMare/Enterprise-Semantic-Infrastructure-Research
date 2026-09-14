@@ -44,7 +44,20 @@ class OpenAICompatibleClient:
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelTurn:
         if not self.api_key:
             raise KRProviderUnavailable("LLM_API_KEY is not set")
-        body = json.dumps({"model": self.model, "messages": messages, "tools": tools, "tool_choice": "auto"}).encode("utf-8")
+        # An empty tool list is an explicit end-of-retrieval turn.  Keeping
+        # ``auto`` here lets some compatible servers replay a tool call from
+        # the conversation even though no tools are offered, which can make
+        # the Agent loop consume its whole iteration budget after it already
+        # has sufficient evidence.  OpenAI-compatible endpoints support the
+        # standard ``none`` choice for this case.
+        body = json.dumps(
+            {
+                "model": self.model,
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": "auto" if tools else "none",
+            }
+        ).encode("utf-8")
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=body,
