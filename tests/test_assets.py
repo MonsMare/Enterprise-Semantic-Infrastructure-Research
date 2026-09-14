@@ -59,6 +59,76 @@ def test_sqlite_store_persists_current_asset_and_revision_history(tmp_path):
     store.close()
 
 
+def test_sqlite_store_indexes_markdown_into_revisioned_heading_chunks(tmp_path):
+    source = tmp_path / "guide.md"
+    source.write_text(
+        "# Guide\n\nIntro paragraph.\n\n## Details\n\nDetail paragraph.\n",
+        encoding="utf-8",
+    )
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+
+    asset = LocalExtractionBackend().extract(source, store=store)
+
+    chunks = store.list_current_chunks()
+
+    assert [chunk.asset_id for chunk in chunks] == [asset.asset_id, asset.asset_id]
+    assert [chunk.revision_id for chunk in chunks] == [asset.revision_id, asset.revision_id]
+    assert [chunk.heading_path for chunk in chunks] == [("Guide",), ("Guide", "Details")]
+    assert [(chunk.start_line, chunk.end_line) for chunk in chunks] == [(1, 3), (5, 7)]
+    assert [chunk.text for chunk in chunks] == [
+        "# Guide\n\nIntro paragraph.",
+        "## Details\n\nDetail paragraph.",
+    ]
+    store.close()
+
+
+def test_sqlite_store_searches_current_chunks_and_honors_asset_scope(tmp_path):
+    first_source = tmp_path / "first.md"
+    first_source.write_text(
+        "# First\n\nA shared phrase appears here.\n",
+        encoding="utf-8",
+    )
+    second_source = tmp_path / "second.md"
+    second_source.write_text(
+        "# Second\n\nA shared phrase appears there.\n",
+        encoding="utf-8",
+    )
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+    backend = LocalExtractionBackend()
+    first = backend.extract(first_source, store=store)
+    backend.extract(second_source, store=store)
+
+    results = store.search_chunks("shared phrase", scope=first.asset_id, limit=10)
+
+    assert len(results) == 1
+    chunk, score = results[0]
+    assert chunk.asset_id == first.asset_id
+    assert "shared phrase" in chunk.text
+    assert isinstance(score, float)
+    store.close()
+
+
+def test_sqlite_store_keeps_old_revision_chunks_out_of_current_projection(tmp_path):
+    source = tmp_path / "policy.md"
+    source.write_text("# Policy\n\nOld rule.\n", encoding="utf-8")
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+    backend = LocalExtractionBackend()
+    first = backend.extract(source, store=store)
+    source.write_text("# Policy\n\nNew rule.\n", encoding="utf-8")
+    second = backend.extract(source, store=store)
+
+    current = store.list_current_chunks()
+    retained = store.connection.execute(
+        "SELECT count(*) FROM asset_chunks WHERE asset_id = ? AND revision_id = ?",
+        (first.asset_id, first.revision_id),
+    ).fetchone()[0]
+
+    assert [chunk.revision_id for chunk in current] == [second.revision_id]
+    assert "New rule." in current[0].text
+    assert retained == 1
+    store.close()
+
+
 def test_sqlite_store_keeps_reparse_history_for_the_same_source_hash(tmp_path):
     source = tmp_path / "policy.md"
     source.write_text("old policy", encoding="utf-8")

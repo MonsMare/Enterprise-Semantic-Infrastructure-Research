@@ -29,6 +29,32 @@ def content_hash(content: str | bytes) -> str:
 
 
 @dataclass(frozen=True)
+class KnowledgeChunk:
+    """A stable, revision-scoped slice of an ingested knowledge asset."""
+
+    chunk_id: str
+    asset_id: str
+    revision_id: str
+    source_name: str
+    heading_path: tuple[str, ...]
+    start_line: int
+    end_line: int
+    text: str
+
+    def __post_init__(self) -> None:
+        if not self.chunk_id or not self.asset_id or not self.revision_id or not self.source_name:
+            raise ValueError("chunk identity and source name are required")
+        if self.start_line <= 0 or self.end_line < self.start_line:
+            raise ValueError("chunk line range is invalid")
+        if not self.text.strip():
+            raise ValueError("chunk text must not be empty")
+        if isinstance(self.heading_path, str):
+            object.__setattr__(self, "heading_path", (self.heading_path,))
+        else:
+            object.__setattr__(self, "heading_path", tuple(str(item) for item in self.heading_path))
+
+
+@dataclass(frozen=True)
 class Locator:
     version: int
     provider: str

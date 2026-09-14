@@ -10,7 +10,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .errors import KRNotFound, KRQueryInvalid
+from .errors import KRLimitExceeded, KRNotFound, KRQueryInvalid
+from .models import KnowledgeChunk, MAX_PAGE_SIZE
+
+
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+_PAGE_MARKER_RE = re.compile(r"^\s*<!--\s*page\s*:\s*([^>]+?)\s*-->\s*$", re.IGNORECASE)
+_MAX_CHUNK_CHARS = 4_000
 
 
 @dataclass(frozen=True)
@@ -25,6 +31,128 @@ class KnowledgeAsset:
     content_list: Any = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     revision_id: str | None = None
+
+
+def _chunk_identifier(asset_id: str, revision_id: str, start_line: int, end_line: int, text: str) -> str:
+    identity = "\x00".join((asset_id, revision_id, str(start_line), str(end_line), text))
+    return "chunk-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _bounded_fragments(
+    lines: list[str],
+    start_line: int,
+    end_line: int,
+) -> list[tuple[int, int, str]]:
+    """Return source line ranges whose text stays within the chunk bound."""
+    raw_text = "\n".join(lines[start_line - 1 : end_line])
+    if len(raw_text) <= _MAX_CHUNK_CHARS:
+        return [(start_line, end_line, raw_text)]
+
+    fragments: list[tuple[int, int, str]] = []
+    group_start: int | None = None
+    group_lines: list[str] = []
+
+    def flush_group() -> None:
+        nonlocal group_start, group_lines
+        if group_start is None or not group_lines:
+            return
+        fragments.append((group_start, group_start + len(group_lines) - 1, "\n".join(group_lines)))
+        group_start = None
+        group_lines = []
+
+    for line_number in range(start_line, end_line + 1):
+        line = lines[line_number - 1]
+        if len(line) > _MAX_CHUNK_CHARS:
+            flush_group()
+            for offset in range(0, len(line), _MAX_CHUNK_CHARS):
+                fragments.append(
+                    (line_number, line_number, line[offset : offset + _MAX_CHUNK_CHARS])
+                )
+            continue
+        candidate = "\n".join((*group_lines, line))
+        if group_lines and len(candidate) > _MAX_CHUNK_CHARS:
+            flush_group()
+        if group_start is None:
+            group_start = line_number
+        group_lines.append(line)
+    flush_group()
+    return fragments
+
+
+def _split_markdown_chunks(markdown: str) -> list[tuple[tuple[str, ...], int, int, str]]:
+    """Split Markdown into heading/paragraph/page-aware bounded source slices."""
+    lines = markdown.splitlines()
+    if not lines:
+        return []
+
+    chunks: list[tuple[tuple[str, ...], int, int, str]] = []
+    heading_stack: list[str] = []
+    current_start: int | None = None
+    current_end: int | None = None
+    current_heading_path: tuple[str, ...] = ()
+    current_has_body = False
+    pending_blank = False
+
+    def flush() -> None:
+        nonlocal current_start, current_end, current_heading_path, current_has_body, pending_blank
+        if current_start is None or current_end is None:
+            return
+        for start_line, end_line, text in _bounded_fragments(lines, current_start, current_end):
+            if text.strip():
+                chunks.append((current_heading_path, start_line, end_line, text))
+        current_start = None
+        current_end = None
+        current_heading_path = ()
+        current_has_body = False
+        pending_blank = False
+
+    for line_number, line in enumerate(lines, 1):
+        heading = _HEADING_RE.match(line)
+        if heading:
+            flush()
+            level = len(heading.group(1))
+            title = heading.group(2).strip().rstrip("#").rstrip()
+            heading_stack[:] = heading_stack[: level - 1]
+            heading_stack.append(title)
+            current_start = line_number
+            current_end = line_number
+            current_heading_path = tuple(heading_stack)
+            current_has_body = False
+            pending_blank = False
+            continue
+
+        if _PAGE_MARKER_RE.match(line):
+            flush()
+            current_start = line_number
+            current_end = line_number
+            current_heading_path = tuple(heading_stack)
+            current_has_body = False
+            pending_blank = False
+            continue
+
+        if not line.strip():
+            if current_start is not None:
+                pending_blank = True
+            continue
+
+        if current_start is None:
+            current_start = line_number
+            current_end = line_number
+            current_heading_path = tuple(heading_stack)
+            current_has_body = True
+        elif pending_blank and current_has_body:
+            flush()
+            current_start = line_number
+            current_end = line_number
+            current_heading_path = tuple(heading_stack)
+            current_has_body = True
+        else:
+            current_end = line_number
+            current_has_body = True
+        pending_blank = False
+
+    flush()
+    return chunks
 
 
 class KnowledgeAssetStore:
@@ -120,6 +248,17 @@ class SQLiteKnowledgeAssetStore:
             self._backfill_fts_if_needed()
         except sqlite3.OperationalError:
             self._fts_available = False
+        try:
+            self.connection.execute(
+                """CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
+                    chunk_id UNINDEXED, asset_id UNINDEXED, revision_id UNINDEXED,
+                    source_name, heading_path, text
+                )"""
+            )
+            self._chunk_fts_available = True
+        except sqlite3.OperationalError:
+            self._chunk_fts_available = False
+        self._backfill_chunk_index_if_needed()
         with self.connection:
             self.connection.execute("PRAGMA user_version = 2")
 
@@ -147,6 +286,43 @@ class SQLiteKnowledgeAssetStore:
                   ON r.asset_id = a.asset_id AND r.revision_id = a.current_revision_id
                 """
             )
+
+    def _backfill_chunk_index_if_needed(self) -> None:
+        """Build current chunks for existing databases and refresh their FTS projection."""
+        current_rows = self.connection.execute(
+            """
+            SELECT a.asset_id, a.current_revision_id, r.source_name, r.markdown
+            FROM assets a
+            JOIN asset_revisions r
+              ON r.asset_id = a.asset_id AND r.revision_id = a.current_revision_id
+            """
+        ).fetchall()
+        with self.connection:
+            for row in current_rows:
+                count = self.connection.execute(
+                    "SELECT count(*) FROM asset_chunks WHERE asset_id = ? AND revision_id = ?",
+                    (row["asset_id"], row["current_revision_id"]),
+                ).fetchone()[0]
+                if count:
+                    continue
+                self._insert_revision_chunks(
+                    asset_id=row["asset_id"],
+                    revision_id=row["current_revision_id"],
+                    source_name=row["source_name"],
+                    markdown=row["markdown"],
+                )
+            if self._chunk_fts_available:
+                self.connection.execute("DELETE FROM chunk_fts")
+                self.connection.execute(
+                    """
+                    INSERT INTO chunk_fts(chunk_id, asset_id, revision_id, source_name, heading_path, text)
+                    SELECT c.chunk_id, c.asset_id, c.revision_id, c.source_name,
+                           c.heading_path_json, c.text
+                    FROM asset_chunks c
+                    JOIN assets a
+                      ON a.asset_id = c.asset_id AND a.current_revision_id = c.revision_id
+                    """
+                )
 
     def _create_schema(self) -> None:
         statements = (
@@ -187,6 +363,19 @@ class SQLiteKnowledgeAssetStore:
             )""",
             "CREATE INDEX IF NOT EXISTS idx_asset_revisions_hash ON asset_revisions(source_hash)",
             "CREATE INDEX IF NOT EXISTS idx_asset_artifacts_asset ON asset_artifacts(asset_id, revision_id)",
+            """CREATE TABLE IF NOT EXISTS asset_chunks (
+                chunk_id TEXT PRIMARY KEY,
+                asset_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                source_name TEXT NOT NULL,
+                heading_path_json TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                FOREIGN KEY (asset_id, revision_id)
+                    REFERENCES asset_revisions(asset_id, revision_id) ON DELETE CASCADE
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_asset_chunks_revision ON asset_chunks(asset_id, revision_id, start_line, end_line)",
         )
         with self.connection:
             for statement in statements:
@@ -302,6 +491,47 @@ class SQLiteKnowledgeAssetStore:
         finally:
             self.connection.execute("PRAGMA foreign_keys = ON")
 
+    def _insert_revision_chunks(
+        self,
+        *,
+        asset_id: str,
+        revision_id: str,
+        source_name: str,
+        markdown: str,
+    ) -> list[KnowledgeChunk]:
+        chunks: list[KnowledgeChunk] = []
+        for heading_path, start_line, end_line, text in _split_markdown_chunks(markdown):
+            chunk = KnowledgeChunk(
+                chunk_id=_chunk_identifier(asset_id, revision_id, start_line, end_line, text),
+                asset_id=asset_id,
+                revision_id=revision_id,
+                source_name=source_name,
+                heading_path=heading_path,
+                start_line=start_line,
+                end_line=end_line,
+                text=text,
+            )
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO asset_chunks(
+                    chunk_id, asset_id, revision_id, source_name, heading_path_json,
+                    start_line, end_line, text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chunk.chunk_id,
+                    chunk.asset_id,
+                    chunk.revision_id,
+                    chunk.source_name,
+                    json.dumps(list(chunk.heading_path), ensure_ascii=False),
+                    chunk.start_line,
+                    chunk.end_line,
+                    chunk.text,
+                ),
+            )
+            chunks.append(chunk)
+        return chunks
+
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -387,6 +617,31 @@ class SQLiteKnowledgeAssetStore:
                     [
                         (asset.asset_id, revision_id, name, sqlite3.Binary(contents))
                         for name, contents in artifact_values.items()
+                    ],
+                )
+            chunks = self._insert_revision_chunks(
+                asset_id=asset.asset_id,
+                revision_id=revision_id,
+                source_name=asset.source_name,
+                markdown=asset.markdown,
+            )
+            if self._chunk_fts_available:
+                self.connection.execute("DELETE FROM chunk_fts WHERE asset_id = ?", (asset.asset_id,))
+                self.connection.executemany(
+                    """
+                    INSERT INTO chunk_fts(chunk_id, asset_id, revision_id, source_name, heading_path, text)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            chunk.chunk_id,
+                            chunk.asset_id,
+                            chunk.revision_id,
+                            chunk.source_name,
+                            " ".join(chunk.heading_path),
+                            chunk.text,
+                        )
+                        for chunk in chunks
                     ],
                 )
             if self._fts_available:
@@ -479,6 +734,127 @@ class SQLiteKnowledgeAssetStore:
                 (asset.asset_id, asset.revision_id),
             ).fetchall()
         return {row["name"]: bytes(row["contents"]) for row in rows}
+
+    @staticmethod
+    def _chunk_from_row(row: sqlite3.Row) -> KnowledgeChunk:
+        return KnowledgeChunk(
+            chunk_id=row["chunk_id"],
+            asset_id=row["asset_id"],
+            revision_id=row["revision_id"],
+            source_name=row["source_name"],
+            heading_path=tuple(json.loads(row["heading_path_json"])),
+            start_line=int(row["start_line"]),
+            end_line=int(row["end_line"]),
+            text=row["text"],
+        )
+
+    def list_current_chunks(self, asset_id: str | None = None) -> list[KnowledgeChunk]:
+        """List chunks projected from each asset's current revision."""
+        query = """
+            SELECT c.chunk_id, c.asset_id, c.revision_id, c.source_name,
+                   c.heading_path_json, c.start_line, c.end_line, c.text
+            FROM asset_chunks c
+            JOIN assets a
+              ON a.asset_id = c.asset_id AND a.current_revision_id = c.revision_id
+        """
+        params: list[Any] = []
+        if asset_id is not None:
+            query += " WHERE c.asset_id = ?"
+            params.append(asset_id)
+        query += " ORDER BY lower(c.source_name), c.asset_id, c.start_line, c.end_line, c.chunk_id"
+        with self._lock:
+            rows = self.connection.execute(query, params).fetchall()
+        return [self._chunk_from_row(row) for row in rows]
+
+    def search_chunks(
+        self,
+        query: str,
+        *,
+        scope: str | None,
+        limit: int,
+    ) -> list[tuple[KnowledgeChunk, float]]:
+        """Return current-revision FTS candidates and their lexical scores."""
+        if not query.strip():
+            raise KRQueryInvalid("search query must not be empty")
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        if limit > MAX_PAGE_SIZE:
+            raise KRLimitExceeded(f"limit cannot exceed {MAX_PAGE_SIZE}")
+
+        tokens = list(dict.fromkeys(re.findall(r"\w+", query.casefold())))
+        if not tokens:
+            raise KRQueryInvalid("search query must contain searchable terms")
+        fts_terms = " OR ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
+        fts_query = (
+            f"(source_name : ({fts_terms}) OR heading_path : ({fts_terms}) OR text : ({fts_terms}))"
+        )
+        scope_sql = ""
+        scope_params: list[Any] = []
+        if scope is not None and scope.strip():
+            scope_sql = " AND (a.asset_id = ? OR lower(r.source_name) = lower(?) OR lower(r.source_path) = lower(?))"
+            scope_params.extend((scope, scope, scope))
+
+        rows: list[sqlite3.Row] = []
+        if self._chunk_fts_available:
+            try:
+                with self._lock:
+                    rows = self.connection.execute(
+                        f"""
+                        SELECT c.chunk_id, c.asset_id, c.revision_id, c.source_name,
+                               c.heading_path_json, c.start_line, c.end_line, c.text,
+                               bm25(chunk_fts, 0.0, 5.0, 3.0, 1.0) AS relevance
+                        FROM chunk_fts
+                        JOIN asset_chunks c ON c.chunk_id = chunk_fts.chunk_id
+                        JOIN assets a
+                          ON a.asset_id = c.asset_id AND a.current_revision_id = c.revision_id
+                        JOIN asset_revisions r
+                          ON r.asset_id = c.asset_id AND r.revision_id = c.revision_id
+                        WHERE chunk_fts MATCH ?{scope_sql}
+                        ORDER BY relevance, c.chunk_id
+                        LIMIT ?
+                        """,
+                        (fts_query, *scope_params, limit),
+                    ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+
+        if rows:
+            return [(self._chunk_from_row(row), float(-row["relevance"])) for row in rows]
+
+        # SQLite installations without FTS5 still get token-based candidates;
+        # matching remains scoped in SQL and does not require a contiguous phrase.
+        conditions: list[str] = []
+        fallback_params: list[Any] = []
+        for token in tokens:
+            pattern = f"%{token}%"
+            conditions.append(
+                "(lower(c.source_name) LIKE ? OR lower(c.heading_path_json) LIKE ? OR lower(c.text) LIKE ?)"
+            )
+            fallback_params.extend((pattern, pattern, pattern))
+        fallback_sql = " OR ".join(conditions)
+        fallback_scope = scope_sql
+        with self._lock:
+            rows = self.connection.execute(
+                f"""
+                SELECT c.chunk_id, c.asset_id, c.revision_id, c.source_name,
+                       c.heading_path_json, c.start_line, c.end_line, c.text
+                FROM asset_chunks c
+                JOIN assets a
+                  ON a.asset_id = c.asset_id AND a.current_revision_id = c.revision_id
+                JOIN asset_revisions r
+                  ON r.asset_id = c.asset_id AND r.revision_id = c.revision_id
+                WHERE ({fallback_sql}){fallback_scope}
+                ORDER BY c.start_line, c.end_line, c.chunk_id
+                LIMIT ?
+                """,
+                (*fallback_params, *scope_params, limit),
+            ).fetchall()
+        results: list[tuple[KnowledgeChunk, float]] = []
+        for row in rows:
+            folded = f"{row['source_name']} {row['heading_path_json']} {row['text']}".casefold()
+            score = float(sum(token in folded for token in tokens))
+            results.append((self._chunk_from_row(row), score))
+        return results
 
     def search_current(self, query: str) -> list[KnowledgeAsset]:
         """Search the current revision through SQLite FTS with a literal fallback."""

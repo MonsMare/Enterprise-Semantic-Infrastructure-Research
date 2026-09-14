@@ -12,6 +12,7 @@ from knowledge_runtime.errors import (
 )
 from knowledge_runtime.models import (
     Evidence,
+    KnowledgeChunk,
     Locator,
     Page,
     ProviderDescriptor,
@@ -94,6 +95,23 @@ def test_provider_descriptor_declares_operations_and_limits():
 
 def test_content_hash_accepts_text_and_bytes():
     assert content_hash("hello") == content_hash(b"hello")
+
+
+def test_knowledge_chunk_is_a_stable_revision_value_object():
+    chunk = KnowledgeChunk(
+        chunk_id="chunk-1",
+        asset_id="asset-1",
+        revision_id="revision-1",
+        source_name="guide.md",
+        heading_path=("Guide", "Details"),
+        start_line=5,
+        end_line=7,
+        text="## Details\n\nDetail paragraph.",
+    )
+
+    assert chunk.heading_path == ("Guide", "Details")
+    assert chunk.start_line == 5
+    assert chunk.end_line == 7
 
 
 @pytest.mark.parametrize("error_type", [KRNotFound, KRInvalidLocator, KRStaleLocator, KRUnsupported, KRLimitExceeded])
