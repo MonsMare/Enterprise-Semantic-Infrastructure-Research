@@ -43,8 +43,10 @@ python -m knowledge_runtime.cli ingest .kr-data\actuarial-downloads --backend lo
 python -m knowledge_runtime.cli benchmark-retrieval .\benchmarks\actuarial\questions.jsonl --store .kr-data\actuarial.db --output .kr-data\actuarial-retrieval-report.json
 ```
 
-The retrieval-only run does not call an LLM. It verifies source rank, reads the
-expected source, checks evidence phrases, and records latency and evidence size.
+The retrieval-only run does not call an LLM. It verifies source rank and chunk
+evidence rank separately, reads expected evidence, checks evidence phrases,
+and records latency and evidence size. The latest offline iteration report is
+[`docs/reports/2026-09-14-hybrid-retrieval-results.md`](../../docs/reports/2026-09-14-hybrid-retrieval-results.md).
 The separate `benchmark` command runs the Qwen 3.8 Agent Retrieval Loop when
 `LLM_API_KEY` is configured.
 
@@ -77,6 +79,12 @@ Evidence、回答引用该 Evidence 为准。弱查询排名门槛失败是有�
 
 对于中文问题，使用 `required_claims` 将可接受的中英文答案短语与来源中的支持短语
 逐条配对；这样答案语言可以跟随用户，而证据核验仍对照原文。
+
+In the fuzzy dataset, `retrieval_query` is a human-authored gold search query,
+not an Agent-generated rewrite; only the live `benchmark` command measures the
+queries Qwen actually sends to KR. `weak_query_probes.jsonl` uses terse KR-only
+queries such as `data`, `estimate`, and `models` to separate source discovery
+from evidence localization.
 
 To measure how SQLite search latency, Hit@k/MRR, and Evidence localization
 change as synthetic corpus size increases, see [the scale benchmark](../scale/README.md).

@@ -34,13 +34,13 @@
 - Add `SQLiteKnowledgeAssetStore.list_current_chunks(asset_id: str | None = None) -> list[KnowledgeChunk]`.
 - Add `SQLiteKnowledgeAssetStore.search_chunks(query: str, *, scope: str | None, limit: int) -> list[tuple[KnowledgeChunk, float]]` for FTS candidates.
 
-- [ ] Write a failing test that an ingested Markdown asset creates multiple chunks with heading path and exact line ranges.
-- [ ] Run `pytest tests/test_assets.py -k chunk -q`; expect failure because chunk schema/API is absent.
-- [ ] Add `KnowledgeChunk`, chunk table, and chunk FTS schema. Use a deterministic chunk id derived from asset/revision/start/end/text.
-- [ ] Rebuild only current-revision chunks after `put`; remove stale current projections while retaining revision history.
-- [ ] Implement paragraph/heading/page-aware splitting with a bounded fallback chunk for long paragraphs.
-- [ ] Run the focused tests and then `pytest tests/test_assets.py tests/test_models.py -q`.
-- [ ] Commit as `feat: add revisioned paragraph evidence index`.
+- [x] Write a failing test that an ingested Markdown asset creates multiple chunks with heading path and exact line ranges.
+- [x] Run `pytest tests/test_assets.py -k chunk -q`; expect failure because chunk schema/API is absent.
+- [x] Add `KnowledgeChunk`, chunk table, and chunk FTS schema. Use a deterministic chunk id derived from asset/revision/start/end/text.
+- [x] Rebuild only current-revision chunks after `put`; remove stale current projections while retaining revision history.
+- [x] Implement paragraph/heading/page-aware splitting with a bounded fallback chunk for long paragraphs.
+- [x] Run the focused tests and then `pytest tests/test_assets.py tests/test_models.py -q`.
+- [x] Commit as `feat: add revisioned paragraph evidence index`.
 
 ### Task 2: Chunk-first provider, scope fix, and hybrid scoring
 
@@ -56,34 +56,33 @@
 - `AssetKnowledgeProvider.search` returns one `SearchHit` per ranked chunk and its locator selector is `{type: "chunk", id, start, end}`.
 - `read` resolves chunk selectors through the current revision and returns the same Evidence contract.
 
-- [ ] Write failing tests for a weak query whose target evidence is in a later paragraph, and for a scoped multiword search that must return the target chunk.
-- [ ] Run the focused tests and confirm the old document-window behavior fails the new assertions.
-- [ ] Implement chunk FTS ranking, deterministic local vector score (word/character n-gram hashing), and RRF fusion; expose score only through ordering, not as evidence text.
-- [ ] Implement scope filtering by asset id, source name, or source path in SQLite before ranking; never delegate scoped asset search to `MemoryProvider.search`.
-- [ ] Add chunk selector support to read and stat paths without invalidating old line locators.
-- [ ] Run provider/asset tests and the full suite.
-- [ ] Commit as `feat: retrieve ranked evidence chunks`.
+- [x] Write failing tests for a weak query whose target evidence is in a later paragraph, and for a scoped multiword search that must return the target chunk.
+- [x] Run the focused tests and confirm the old document-window behavior fails the new assertions.
+- [x] Implement chunk FTS ranking, deterministic local vector score (word/character n-gram hashing), and RRF fusion; expose score only through ordering, not as evidence text.
+- [x] Implement scope filtering by asset id, source name, or source path in SQLite before ranking; never delegate scoped asset search to `MemoryProvider.search`.
+- [x] Add chunk selector support to read and stat paths without invalidating old line locators.
+- [x] Run provider/asset tests and the full suite.
+- [x] Commit as `feat: retrieve ranked evidence chunks`.
 
-### Task 3: Retrieval benchmark and agent evidence regression
+### Task 3: Retrieval benchmark and evidence-rank regression
 
 **Files:**
 - Modify: `knowledge_runtime/evaluation.py`
 - Modify: `benchmarks/actuarial/README.md`
-- Create: `benchmarks/actuarial/run_hybrid_benchmark.py`
 - Test: `tests/test_evaluation.py`
 - Test: `tests/test_end_to_end.py`
 
 **Interfaces:**
-- Benchmark report records `document_hit_at_1`, `chunk_hit_at_1/3`, `evidence_location_rate`, `first_query` versus `gold_query`, and latency percentiles.
+- Benchmark report separates source hit rank, first expected chunk rank, oracle-style gold-evidence rank, evidence-location rate, and latency percentiles. The live Agent benchmark remains a separate measurement.
 - Existing report fields remain readable for downstream tooling.
 
-- [ ] Write failing evaluator tests proving document hit can be 1 while chunk evidence location is 0, and that the report keeps both metrics.
-- [ ] Run focused evaluator tests and confirm missing chunk metrics.
-- [ ] Implement chunk-aware gold phrase checks and report separation between manual gold-query retrieval and Agent-originated queries.
-- [ ] Add a deterministic actuarial benchmark runner comparing legacy asset search and chunk hybrid search on the existing corpus.
-- [ ] Run offline benchmark without LLM calls; save report under `.kr-data/` and document interpretation limits.
-- [ ] Run the full test suite and `git diff --check`.
-- [ ] Commit as `test: benchmark evidence chunk retrieval`.
+- [x] Write failing evaluator tests proving source hit can be 1 while gold evidence appears in a later chunk, and that the report keeps both metrics.
+- [x] Run focused evaluator tests and confirm missing evidence-rank metrics.
+- [x] Implement chunk-aware gold phrase checks, source/evidence rank separation, and evidence reads ordered by global chunk rank.
+- [x] Use the deterministic `benchmark-retrieval` CLI on the actuarial corpus and compare its source-level baseline with the hybrid report, while recording that evidence-read scope changed.
+- [x] Run offline benchmark without LLM calls; save reports under `.kr-data/` and document interpretation limits.
+- [x] Run the full test suite and `git diff --check`.
+- [x] Commit as `test: benchmark evidence chunk retrieval`.
 
 ### Task 4: End-to-end verification and review
 
@@ -92,8 +91,8 @@
 - Modify: `benchmarks/actuarial/README.md`
 - Create: `docs/reports/2026-09-14-hybrid-retrieval-results.md`
 
-- [ ] Run all tests and the offline actuarial benchmark.
-- [ ] Compare the old reports with the new report using document, chunk, evidence, answer, and latency metrics.
-- [ ] Record any metric regressions and root causes in the results report.
-- [ ] Update usage examples for chunk locators and semantic-weight configuration.
-- [ ] Commit as `docs: report hybrid evidence retrieval results`.
+- [x] Run all tests and the offline actuarial benchmark.
+- [x] Compare old source-level reports with new source, evidence, and latency metrics; live answer quality remains unmeasured without an Agent API key in the process environment.
+- [x] Record metric regressions and root causes in the results report.
+- [x] Update usage examples for chunk locators and semantic-weight configuration.
+- [x] Commit as `docs: report hybrid evidence retrieval results`.
