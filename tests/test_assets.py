@@ -7,12 +7,14 @@ from io import BytesIO
 
 import pytest
 
+import knowledge_runtime.assets as assets_module
 from knowledge_runtime.assets import KnowledgeAsset, KnowledgeAssetStore, SQLiteKnowledgeAssetStore
 from knowledge_runtime.asset_provider import AssetKnowledgeProvider
 from knowledge_runtime.errors import KRStaleLocator
 from knowledge_runtime.extractors import LocalExtractionBackend
 from knowledge_runtime.mineru_backend import MinerUCloudBackend
 from knowledge_runtime.models import SearchOptions
+from knowledge_runtime.retrieval import LocalNgramEncoder, SparseVector
 
 
 def test_local_backend_creates_asset_with_source_and_parser_provenance(tmp_path):
@@ -107,6 +109,310 @@ def test_sqlite_store_searches_current_chunks_and_honors_asset_scope(tmp_path):
     assert "shared phrase" in chunk.text
     assert isinstance(score, float)
     store.close()
+
+
+def test_sqlite_store_persists_revision_scoped_local_chunk_vectors(tmp_path):
+    source = tmp_path / "policy.md"
+    source.write_text("# Policy\n\nAnnual reserve review is required.", encoding="utf-8")
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+    backend = LocalExtractionBackend()
+    first = backend.extract(source, store=store)
+    first_chunks = store.list_current_chunks_with_vectors(
+        encoder_id=LocalNgramEncoder().encoder_id,
+    )
+    first_vector = first_chunks[0][1]
+
+    source.write_text("# Policy\n\nQuarterly capital review is required.", encoding="utf-8")
+    second = backend.extract(source, store=store)
+    current = store.list_current_chunks_with_vectors(
+        encoder_id=LocalNgramEncoder().encoder_id,
+    )
+
+    assert isinstance(first_vector, SparseVector)
+    assert first_chunks[0][0].revision_id == first.revision_id
+    assert len(current) == 1
+    assert current[0][0].revision_id == second.revision_id
+    assert current[0][1] != first_vector
+    assert store.connection.execute("SELECT count(*) FROM asset_chunk_vectors").fetchone()[0] == 2
+    store.close()
+
+
+def test_sqlite_store_backfills_local_vectors_when_opening_v2_database(tmp_path):
+    source = tmp_path / "policy.md"
+    source.write_text("# Policy\n\nQuarterly reserve review is required.", encoding="utf-8")
+    database = tmp_path / "knowledge.db"
+    store = SQLiteKnowledgeAssetStore(database)
+    LocalExtractionBackend().extract(source, store=store)
+    store.connection.execute("DROP TABLE asset_chunk_vectors")
+    store.connection.execute("PRAGMA user_version = 2")
+    store.close()
+
+    upgraded = SQLiteKnowledgeAssetStore(database)
+
+    rows = upgraded.list_current_chunks_with_vectors(
+        encoder_id=LocalNgramEncoder().encoder_id,
+    )
+    assert len(rows) == 1
+    assert rows[0][1].values
+    assert upgraded.connection.execute("PRAGMA user_version").fetchone()[0] == 6
+    upgraded.close()
+
+
+def test_asset_provider_caches_persisted_local_vectors_across_queries(tmp_path):
+    source = tmp_path / "policy.md"
+    source.write_text(
+        "# Policy\n\nAnnual reserve review is required.\n\nCapital review is documented.",
+        encoding="utf-8",
+    )
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+    LocalExtractionBackend().extract(source, store=store)
+    original = store.list_current_chunks_with_vectors
+    vector_loads = 0
+
+    def count_vector_loads(**kwargs):
+        nonlocal vector_loads
+        vector_loads += 1
+        return original(**kwargs)
+
+    store.list_current_chunks_with_vectors = count_vector_loads
+    provider = AssetKnowledgeProvider(store)
+    provider.search("reserve review")
+    provider.search("capital review")
+
+    assert vector_loads == 1
+    store.close()
+
+
+def test_asset_provider_finds_morphological_match_without_fts_token_overlap(tmp_path):
+    source = tmp_path / "financial-condition.md"
+    source.write_text(
+        "# Financial condition\n\nSolvencies are assessed at the end of each year.",
+        encoding="utf-8",
+    )
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+    LocalExtractionBackend().extract(source, store=store)
+    provider = AssetKnowledgeProvider(store)
+
+    assert store.search_chunks("solvency", scope=None, limit=10) == []
+    semantic_candidates = store.search_chunk_vectors(
+        LocalNgramEncoder().encode("solvency"),
+        encoder_id=LocalNgramEncoder().encoder_id,
+        scope=None,
+        limit=10,
+    )
+    assert semantic_candidates
+    assert semantic_candidates[0][0].source_name == source.name
+    hits = provider.search("solvency", options=SearchOptions(limit=10)).items
+
+    assert hits
+    assert hits[0].display_name == source.name
+    assert "Solvencies" in provider.read(hits[0].locator).content
+    store.close()
+
+
+def test_asset_provider_rejects_local_hash_collision_only_candidates(tmp_path):
+    source = tmp_path / "actuarial-guide.md"
+    source.write_text(
+        "# Actuarial guide\n\nA point estimate and probability distribution support reserve review.",
+        encoding="utf-8",
+    )
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+    LocalExtractionBackend().extract(source, store=store)
+
+    hits = AssetKnowledgeProvider(store).search(
+        "那四种？",
+        options=SearchOptions(limit=10),
+    ).items
+
+    assert hits == []
+    store.close()
+
+
+def test_asset_provider_preserves_semantic_only_recall_for_large_stores(tmp_path):
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+    backend = LocalExtractionBackend()
+    for index in range(205):
+        source = tmp_path / f"policy-{index:03d}.md"
+        body = "Portfolio solvency cushion." if index == 204 else f"Policy note {index}."
+        source.write_text(f"# Policy {index}\n\n{body}", encoding="utf-8")
+        backend.extract(source, store=store)
+
+    class CountingEncoder:
+        def __init__(self):
+            self.inputs = []
+
+        def encode(self, text):
+            self.inputs.append(text)
+            if text == "How are future claims protected?" or "solvency cushion" in text:
+                return (1.0, 0.0)
+            return (0.0, 1.0)
+
+    encoder = CountingEncoder()
+    hits = AssetKnowledgeProvider(store, semantic_encoder=encoder).search(
+        "How are future claims protected?",
+        options=SearchOptions(limit=10, semantic_weight=1.0),
+    ).items
+
+    assert hits
+    assert hits[0].display_name == "policy-204.md"
+    assert len(encoder.inputs) > 201
+    store.close()
+
+
+def test_asset_provider_falls_back_when_local_encoder_dimension_is_not_indexed(tmp_path):
+    source = tmp_path / "financial-condition.md"
+    source.write_text(
+        "# Financial condition\n\nSolvencies are assessed at the end of each year.",
+        encoding="utf-8",
+    )
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+    LocalExtractionBackend().extract(source, store=store)
+
+    hits = AssetKnowledgeProvider(
+        store,
+        semantic_encoder=LocalNgramEncoder(dimensions=4096),
+    ).search("solvency", options=SearchOptions(limit=10)).items
+
+    assert hits
+    assert hits[0].display_name == source.name
+    store.close()
+
+
+def test_asset_provider_case_sensitive_search_requires_the_complete_query(tmp_path):
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+    backend = LocalExtractionBackend()
+    for name, content in (
+        ("standard-23.md", "# ASOP 23\n\nData quality guidance."),
+        ("standard-43.md", "# ASOP 43\n\nUnpaid claim estimates."),
+    ):
+        source = tmp_path / name
+        source.write_text(content, encoding="utf-8")
+        backend.extract(source, store=store)
+
+    hits = AssetKnowledgeProvider(store).search(
+        "ASOP 43",
+        options=SearchOptions(limit=10, case_sensitive=True),
+    ).items
+
+    assert [hit.display_name for hit in hits] == ["standard-43.md"]
+    separated_words = AssetKnowledgeProvider(store).search(
+        "ASOP 43 estimates",
+        options=SearchOptions(limit=10, case_sensitive=True),
+    ).items
+    # case_sensitive retains MemoryProvider's literal-substring contract; FTS
+    # may find individual terms in separate locations, but the post-filter must
+    # not turn that into a case-sensitive multi-term search.
+    assert separated_words == []
+    store.close()
+
+
+def test_asset_provider_uses_heading_weight_for_lexical_ranking(tmp_path):
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+    backend = LocalExtractionBackend()
+    title_source = tmp_path / "heading.md"
+    title_source.write_text("# Precision marker\n\nBackground material only.", encoding="utf-8")
+    backend.extract(title_source, store=store)
+    body_source = tmp_path / "other.md"
+    body_source.write_text(
+        "# Other\n\n" + "precision " * 30,
+        encoding="utf-8",
+    )
+    backend.extract(body_source, store=store)
+
+    hits = AssetKnowledgeProvider(store).search(
+        "precision",
+        options=SearchOptions(limit=10, semantic_weight=0.0),
+    ).items
+
+    assert hits[0].display_name == title_source.name
+    store.close()
+
+
+def test_sqlite_store_does_not_rebuild_healthy_chunk_fts_on_open(tmp_path, monkeypatch):
+    source = tmp_path / "guide.md"
+    source.write_text("# Guide\n\nStable searchable content.", encoding="utf-8")
+    database = tmp_path / "knowledge.db"
+    store = SQLiteKnowledgeAssetStore(database)
+    LocalExtractionBackend().extract(source, store=store)
+    store.close()
+
+    statements = []
+    original_connect = assets_module.sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(assets_module.sqlite3, "connect", traced_connect)
+    reopened = SQLiteKnowledgeAssetStore(database)
+
+    assert not any("DELETE FROM chunk_fts" in statement for statement in statements)
+    assert reopened.search_chunks("searchable content", scope=None, limit=10)
+    reopened.close()
+
+
+def test_sqlite_vector_search_does_not_depend_on_large_sql_bind_limit(tmp_path):
+    source = tmp_path / "long-policy.md"
+    source.write_text(
+        "# Policy\n\n" + " ".join(f"specialterm{index}" for index in range(180)),
+        encoding="utf-8",
+    )
+    store = SQLiteKnowledgeAssetStore(tmp_path / "knowledge.db")
+    LocalExtractionBackend().extract(source, store=store)
+    old_limit = store.connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 32)
+    try:
+        hits = store.search_chunk_vectors(
+            LocalNgramEncoder().encode(" ".join(f"specialterm{index}" for index in range(180))),
+            encoder_id=LocalNgramEncoder().encoder_id,
+            scope=None,
+            limit=10,
+        )
+    finally:
+        store.connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, old_limit)
+
+    assert hits
+    assert hits[0][0].source_name == source.name
+    store.close()
+
+
+def test_sqlite_v5_posting_table_is_removed_during_schema_upgrade(tmp_path):
+    source = tmp_path / "policy.md"
+    source.write_text("# Policy\n\nStable current evidence.", encoding="utf-8")
+    database = tmp_path / "knowledge.db"
+    store = SQLiteKnowledgeAssetStore(database)
+    asset = LocalExtractionBackend().extract(source, store=store)
+    chunk = store.list_current_chunks(asset.asset_id)[0]
+    store.connection.execute(
+        """CREATE TABLE asset_chunk_vector_terms (
+            chunk_id TEXT NOT NULL,
+            encoder_id TEXT NOT NULL,
+            coordinate INTEGER NOT NULL,
+            weight REAL NOT NULL,
+            PRIMARY KEY (chunk_id, encoder_id, coordinate)
+        )"""
+    )
+    store.connection.execute(
+        "INSERT INTO asset_chunk_vector_terms VALUES (?, ?, ?, ?)",
+        (chunk.chunk_id, LocalNgramEncoder().encoder_id, 1, 0.5),
+    )
+    store.connection.commit()
+    store.connection.execute("PRAGMA user_version = 5")
+    store.connection.commit()
+    store.close()
+
+    upgraded = SQLiteKnowledgeAssetStore(database)
+
+    assert upgraded.connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='asset_chunk_vector_terms'"
+    ).fetchone() is None
+    assert upgraded.connection.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert len(
+        upgraded.list_current_chunks_with_vectors(
+            encoder_id=LocalNgramEncoder().encoder_id,
+        )
+    ) == 1
+    upgraded.close()
 
 
 def test_asset_provider_returns_chunk_locators_and_chunk_evidence(tmp_path):
@@ -373,7 +679,7 @@ def test_sqlite_store_migrates_v1_database_without_losing_assets_or_artifacts(tm
     assert migrated.metadata == {"origin": "v1"}
     assert store.derived_artifacts("asset-v1") == {"page.png": b"legacy-bytes"}
     assert [asset.asset_id for asset in store.search_current("Legacy parsed content")] == ["asset-v1"]
-    assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 6
     assert store.connection.execute("PRAGMA foreign_key_check").fetchall() == []
     store.close()
 

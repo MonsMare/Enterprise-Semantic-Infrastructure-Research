@@ -12,6 +12,7 @@ from typing import Any
 
 from .errors import KRLimitExceeded, KRNotFound, KRQueryInvalid
 from .models import KnowledgeChunk, MAX_PAGE_SIZE
+from .retrieval import LocalNgramEncoder, SparseVector, cosine_similarity
 
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
@@ -226,9 +227,11 @@ class SQLiteKnowledgeAssetStore:
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute("PRAGMA busy_timeout = 30000")
         self._lock = threading.RLock()
+        self._local_encoder = LocalNgramEncoder()
         self._initialize()
 
     def _initialize(self) -> None:
+        schema_version = self.connection.execute("PRAGMA user_version").fetchone()[0]
         tables = {
             row[0]
             for row in self.connection.execute(
@@ -237,7 +240,16 @@ class SQLiteKnowledgeAssetStore:
         }
         if "assets" in tables and self.connection.execute("PRAGMA user_version").fetchone()[0] < 2:
             self._migrate_legacy_schema()
+        if schema_version < 6:
+            with self.connection:
+                self.connection.execute("DROP TABLE IF EXISTS asset_chunk_vector_terms")
         self._create_schema()
+        vector_columns = {
+            row[1] for row in self.connection.execute("PRAGMA table_info(asset_chunk_vectors)")
+        }
+        if "vector_blob" not in vector_columns:
+            with self.connection:
+                self.connection.execute("ALTER TABLE asset_chunk_vectors ADD COLUMN vector_blob BLOB")
         try:
             self.connection.execute(
                 """CREATE VIRTUAL TABLE IF NOT EXISTS asset_fts USING fts5(
@@ -260,7 +272,7 @@ class SQLiteKnowledgeAssetStore:
             self._chunk_fts_available = False
         self._backfill_chunk_index_if_needed()
         with self.connection:
-            self.connection.execute("PRAGMA user_version = 2")
+            self.connection.execute("PRAGMA user_version = 6")
 
     def _backfill_fts_if_needed(self) -> None:
         """Restore the current-revision FTS projection after schema upgrades.
@@ -289,29 +301,69 @@ class SQLiteKnowledgeAssetStore:
 
     def _backfill_chunk_index_if_needed(self) -> None:
         """Build current chunks for existing databases and refresh their FTS projection."""
-        current_rows = self.connection.execute(
+        missing_chunk_rows = self.connection.execute(
             """
             SELECT a.asset_id, a.current_revision_id, r.source_name, r.markdown
             FROM assets a
             JOIN asset_revisions r
               ON r.asset_id = a.asset_id AND r.revision_id = a.current_revision_id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM asset_chunks c
+                WHERE c.asset_id = a.asset_id AND c.revision_id = a.current_revision_id
+            )
             """
         ).fetchall()
         with self.connection:
-            for row in current_rows:
-                count = self.connection.execute(
-                    "SELECT count(*) FROM asset_chunks WHERE asset_id = ? AND revision_id = ?",
-                    (row["asset_id"], row["current_revision_id"]),
-                ).fetchone()[0]
-                if count:
-                    continue
+            for row in missing_chunk_rows:
                 self._insert_revision_chunks(
                     asset_id=row["asset_id"],
                     revision_id=row["current_revision_id"],
                     source_name=row["source_name"],
                     markdown=row["markdown"],
                 )
+            missing_vectors = self.connection.execute(
+                """
+                SELECT c.chunk_id, c.asset_id, c.revision_id, c.source_name,
+                       c.heading_path_json, c.start_line, c.end_line, c.text
+                FROM asset_chunks c
+                JOIN assets a
+                  ON a.asset_id = c.asset_id AND a.current_revision_id = c.revision_id
+                LEFT JOIN asset_chunk_vectors v
+                  ON v.chunk_id = c.chunk_id AND v.encoder_id = ?
+                WHERE v.chunk_id IS NULL OR v.vector_blob IS NULL
+                """,
+                (self._local_encoder.encoder_id,),
+            ).fetchall()
+            for chunk_row in missing_vectors:
+                self._store_local_chunk_vector(self._chunk_from_row(chunk_row))
+
             if self._chunk_fts_available:
+                expected_count = self.connection.execute(
+                    """
+                    SELECT count(*)
+                    FROM asset_chunks c
+                    JOIN assets a
+                      ON a.asset_id = c.asset_id AND a.current_revision_id = c.revision_id
+                    """
+                ).fetchone()[0]
+                indexed_count = self.connection.execute(
+                    "SELECT count(*) FROM chunk_fts"
+                ).fetchone()[0]
+                current_indexed_count = self.connection.execute(
+                    """
+                    SELECT count(*)
+                    FROM chunk_fts f
+                    JOIN asset_chunks c ON c.chunk_id = f.chunk_id
+                    JOIN assets a
+                      ON a.asset_id = c.asset_id AND a.current_revision_id = c.revision_id
+                    """
+                ).fetchone()[0]
+            else:
+                expected_count = indexed_count = current_indexed_count = 0
+            if (
+                self._chunk_fts_available
+                and (indexed_count != expected_count or current_indexed_count != expected_count)
+            ):
                 self.connection.execute("DELETE FROM chunk_fts")
                 self.connection.execute(
                     """
@@ -376,6 +428,17 @@ class SQLiteKnowledgeAssetStore:
                     REFERENCES asset_revisions(asset_id, revision_id) ON DELETE CASCADE
             )""",
             "CREATE INDEX IF NOT EXISTS idx_asset_chunks_revision ON asset_chunks(asset_id, revision_id, start_line, end_line)",
+            """CREATE TABLE IF NOT EXISTS asset_chunk_vectors (
+                chunk_id TEXT NOT NULL,
+                encoder_id TEXT NOT NULL,
+                dimensions INTEGER NOT NULL,
+                values_json TEXT NOT NULL,
+                norm REAL NOT NULL,
+                vector_blob BLOB,
+                PRIMARY KEY (chunk_id, encoder_id),
+                FOREIGN KEY (chunk_id) REFERENCES asset_chunks(chunk_id) ON DELETE CASCADE
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_asset_chunk_vectors_encoder ON asset_chunk_vectors(encoder_id, chunk_id)",
         )
         with self.connection:
             for statement in statements:
@@ -487,7 +550,7 @@ class SQLiteKnowledgeAssetStore:
                 self.connection.execute("DROP TABLE asset_artifacts_v1")
                 self.connection.execute("DROP TABLE asset_revisions_v1")
                 self.connection.execute("DROP TABLE assets_v1")
-                self.connection.execute("PRAGMA user_version = 2")
+                self.connection.execute("PRAGMA user_version = 5")
         finally:
             self.connection.execute("PRAGMA foreign_keys = ON")
 
@@ -529,8 +592,33 @@ class SQLiteKnowledgeAssetStore:
                     chunk.text,
                 ),
             )
+            self._store_local_chunk_vector(chunk)
             chunks.append(chunk)
         return chunks
+
+    def _store_local_chunk_vector(self, chunk: KnowledgeChunk) -> None:
+        text = "\n".join((*chunk.heading_path, chunk.text))
+        vector = self._local_encoder.encode(text)
+        self.connection.execute(
+            """
+            INSERT INTO asset_chunk_vectors(
+                chunk_id, encoder_id, dimensions, values_json, norm, vector_blob
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chunk_id, encoder_id) DO UPDATE SET
+                dimensions = excluded.dimensions,
+                values_json = excluded.values_json,
+                norm = excluded.norm,
+                vector_blob = excluded.vector_blob
+            """,
+            (
+                chunk.chunk_id,
+                self._local_encoder.encoder_id,
+                vector.dimensions,
+                "",
+                vector.norm,
+                sqlite3.Binary(vector.to_blob()),
+            ),
+        )
 
     @staticmethod
     def _now() -> str:
@@ -781,6 +869,127 @@ class SQLiteKnowledgeAssetStore:
             rows = self.connection.execute(query, params).fetchall()
         return [self._chunk_from_row(row) for row in rows]
 
+    def list_current_chunks_with_vectors(
+        self,
+        *,
+        encoder_id: str,
+        scope: str | None = None,
+        chunk_ids: set[str] | None = None,
+    ) -> list[tuple[KnowledgeChunk, SparseVector]]:
+        """List current chunks with their persisted encoder-specific vectors."""
+        query = """
+            SELECT c.chunk_id, c.asset_id, c.revision_id, c.source_name,
+                   c.heading_path_json, c.start_line, c.end_line, c.text,
+                   v.dimensions, v.vector_blob, v.norm
+            FROM asset_chunks c
+            JOIN assets a
+              ON a.asset_id = c.asset_id AND a.current_revision_id = c.revision_id
+            JOIN asset_revisions r
+              ON r.asset_id = c.asset_id AND r.revision_id = c.revision_id
+            JOIN asset_chunk_vectors v
+              ON v.chunk_id = c.chunk_id AND v.encoder_id = ?
+        """
+        params: list[Any] = [encoder_id]
+        if scope is not None and scope.strip():
+            query += (
+                " WHERE (a.asset_id = ? OR lower(r.source_name) = lower(?) "
+                "OR lower(r.source_path) = lower(?))"
+            )
+            params.extend((scope, scope, scope))
+        if chunk_ids is not None:
+            if not chunk_ids:
+                return []
+            placeholders = ", ".join("?" for _ in chunk_ids)
+            query += (" WHERE " if " WHERE " not in query else " AND ") + f"c.chunk_id IN ({placeholders})"
+            params.extend(sorted(chunk_ids))
+        query += " ORDER BY lower(c.source_name), c.asset_id, c.start_line, c.end_line, c.chunk_id"
+        with self._lock:
+            rows = self.connection.execute(query, params).fetchall()
+        return [
+            (
+                self._chunk_from_row(row),
+                SparseVector.from_blob(
+                    int(row["dimensions"]),
+                    bytes(row["vector_blob"]),
+                    float(row["norm"]),
+                ),
+            )
+            for row in rows
+        ]
+
+    def search_chunk_vectors(
+        self,
+        query_vector: SparseVector,
+        *,
+        encoder_id: str,
+        scope: str | None,
+        limit: int,
+    ) -> list[tuple[KnowledgeChunk, float]]:
+        """Rank current chunks by exact cosine scan over sparse vectors."""
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        if limit > MAX_PAGE_SIZE:
+            raise KRLimitExceeded(f"limit cannot exceed {MAX_PAGE_SIZE}")
+        if query_vector.norm == 0.0 or not query_vector.indices:
+            return []
+        candidates = [
+            (chunk, cosine_similarity(query_vector, vector))
+            for chunk, vector in self.list_current_chunks_with_vectors(
+                encoder_id=encoder_id,
+                scope=scope,
+            )
+        ]
+        return sorted(
+            (item for item in candidates if item[1] > 0.0),
+            key=lambda item: (-item[1], item[0].chunk_id),
+        )[:limit]
+
+    def has_current_chunk_vector_index(
+        self,
+        encoder_id: str,
+        *,
+        scope: str | None = None,
+    ) -> bool:
+        query = """
+            SELECT 1
+            FROM asset_chunk_vectors v
+            JOIN asset_chunks c ON c.chunk_id = v.chunk_id
+            JOIN assets a
+              ON a.asset_id = c.asset_id AND a.current_revision_id = c.revision_id
+            JOIN asset_revisions r
+              ON r.asset_id = c.asset_id AND r.revision_id = c.revision_id
+            WHERE v.encoder_id = ?
+        """
+        params: list[Any] = [encoder_id]
+        if scope is not None and scope.strip():
+            query += (
+                " AND (a.asset_id = ? OR lower(r.source_name) = lower(?) "
+                "OR lower(r.source_path) = lower(?))"
+            )
+            params.extend((scope, scope, scope))
+        query += " LIMIT 1"
+        with self._lock:
+            return self.connection.execute(query, params).fetchone() is not None
+
+    def count_current_chunks(self, *, scope: str | None = None) -> int:
+        query = """
+            SELECT count(*)
+            FROM asset_chunks c
+            JOIN assets a
+              ON a.asset_id = c.asset_id AND a.current_revision_id = c.revision_id
+            JOIN asset_revisions r
+              ON r.asset_id = c.asset_id AND r.revision_id = c.revision_id
+        """
+        params: list[Any] = []
+        if scope is not None and scope.strip():
+            query += (
+                " WHERE (a.asset_id = ? OR lower(r.source_name) = lower(?) "
+                "OR lower(r.source_path) = lower(?))"
+            )
+            params.extend((scope, scope, scope))
+        with self._lock:
+            return int(self.connection.execute(query, params).fetchone()[0])
+
     def search_chunks(
         self,
         query: str,
@@ -817,7 +1026,7 @@ class SQLiteKnowledgeAssetStore:
                         f"""
                         SELECT c.chunk_id, c.asset_id, c.revision_id, c.source_name,
                                c.heading_path_json, c.start_line, c.end_line, c.text,
-                               bm25(chunk_fts, 0.0, 5.0, 3.0, 1.0) AS relevance
+                               bm25(chunk_fts, 0.0, 0.0, 0.0, 5.0, 3.0, 1.0) AS relevance
                         FROM chunk_fts
                         JOIN asset_chunks c ON c.chunk_id = chunk_fts.chunk_id
                         JOIN assets a

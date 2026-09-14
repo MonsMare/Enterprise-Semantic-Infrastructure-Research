@@ -10,15 +10,62 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import struct
+from array import array
 from collections import Counter
 from collections.abc import Callable, Hashable, Sequence
+from dataclasses import dataclass
 from typing import Protocol, TypeVar
+
+
+@dataclass(frozen=True)
+class SparseVector:
+    """A normalized fixed-dimension vector with compact sorted coordinates."""
+
+    dimensions: int
+    indices: array
+    values: array
+    norm: float
+
+    def __post_init__(self) -> None:
+        if self.dimensions <= 0:
+            raise ValueError("dimensions must be positive")
+        if self.indices.typecode != "I" or self.values.typecode != "d":
+            raise ValueError("sparse coordinates must use unsigned-int indices and float64 values")
+        if len(self.indices) != len(self.values):
+            raise ValueError("sparse coordinate and value counts must match")
+        if any(index < 0 or index >= self.dimensions for index in self.indices):
+            raise ValueError("sparse vector coordinate is out of range")
+
+    @classmethod
+    def from_mapping(cls, dimensions: int, values: dict[int, float], norm: float) -> "SparseVector":
+        coordinates = sorted(values.items())
+        return cls(
+            dimensions=dimensions,
+            indices=array("I", (index for index, _value in coordinates)),
+            values=array("d", (value for _index, value in coordinates)),
+            norm=norm,
+        )
+
+    def to_blob(self) -> bytes:
+        """Serialize sparse coordinates in a compact, platform-independent form."""
+        return b"".join(
+            struct.pack("<Id", index, value)
+            for index, value in zip(self.indices, self.values)
+        )
+
+    @classmethod
+    def from_blob(cls, dimensions: int, value: bytes, norm: float) -> "SparseVector":
+        if len(value) % 12:
+            raise ValueError("sparse vector blob has an invalid length")
+        coordinates = list(struct.iter_unpack("<Id", value))
+        return cls.from_mapping(dimensions, dict(coordinates), norm)
 
 
 class SemanticEncoder(Protocol):
     """Interface for local or remote semantic encoders with vector output."""
 
-    def encode(self, text: str) -> Sequence[float]: ...
+    def encode(self, text: str) -> Sequence[float] | SparseVector: ...
 
 
 class LocalNgramEncoder:
@@ -28,8 +75,9 @@ class LocalNgramEncoder:
         if dimensions <= 0:
             raise ValueError("dimensions must be positive")
         self.dimensions = dimensions
+        self.encoder_id = f"local-ngram-v1:{dimensions}"
 
-    def encode(self, text: str) -> tuple[float, ...]:
+    def encode(self, text: str) -> SparseVector:
         words = re.findall(r"\w+", text.casefold())
         features: Counter[str] = Counter()
         for word in words:
@@ -39,20 +87,58 @@ class LocalNgramEncoder:
                 for index in range(len(padded) - size + 1):
                     features[f"c{size}:{padded[index:index + size]}"] += 0.5
 
-        vector = [0.0] * self.dimensions
+        vector: dict[int, float] = {}
         for feature, weight in features.items():
             digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
             index = int.from_bytes(digest, "big") % self.dimensions
-            vector[index] += weight
+            vector[index] = vector.get(index, 0.0) + weight
 
-        norm = math.sqrt(math.fsum(value * value for value in vector))
+        norm = math.sqrt(math.fsum(value * value for value in vector.values()))
         if norm:
-            vector = [value / norm for value in vector]
-        return tuple(vector)
+            vector = {index: value / norm for index, value in vector.items()}
+        return SparseVector.from_mapping(self.dimensions, vector, 1.0 if norm else 0.0)
 
 
-def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
-    """Return cosine similarity for compatible dense vectors."""
+def cosine_similarity(
+    left: Sequence[float] | SparseVector,
+    right: Sequence[float] | SparseVector,
+) -> float:
+    """Return cosine similarity for compatible dense or sparse vectors."""
+    if isinstance(left, SparseVector) and isinstance(right, SparseVector):
+        if left.dimensions != right.dimensions:
+            raise ValueError("vectors must have the same dimensions")
+        if left.norm == 0.0 or right.norm == 0.0:
+            return 0.0
+        left_index = right_index = 0
+        products: list[float] = []
+        while left_index < len(left.indices) and right_index < len(right.indices):
+            left_coordinate = left.indices[left_index]
+            right_coordinate = right.indices[right_index]
+            if left_coordinate == right_coordinate:
+                products.append(left.values[left_index] * right.values[right_index])
+                left_index += 1
+                right_index += 1
+            elif left_coordinate < right_coordinate:
+                left_index += 1
+            else:
+                right_index += 1
+        dot = math.fsum(products)
+        return dot / (left.norm * right.norm)
+
+    if isinstance(left, SparseVector) or isinstance(right, SparseVector):
+        sparse, dense = (left, right) if isinstance(left, SparseVector) else (right, left)
+        if len(dense) != sparse.dimensions:
+            raise ValueError("vectors must have the same dimensions")
+        sparse_norm = sparse.norm
+        dense_norm = math.sqrt(math.fsum(float(value) ** 2 for value in dense))
+        if sparse_norm == 0.0 or dense_norm == 0.0:
+            return 0.0
+        dot = math.fsum(
+            value * float(dense[index])
+            for index, value in zip(sparse.indices, sparse.values)
+        )
+        return dot / (sparse_norm * dense_norm)
+
     if len(left) != len(right):
         raise ValueError("vectors must have the same dimensions")
     left_norm = math.sqrt(math.fsum(float(value) ** 2 for value in left))

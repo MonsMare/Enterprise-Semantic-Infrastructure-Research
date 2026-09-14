@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import math
+from collections import OrderedDict
 from dataclasses import replace
 from typing import Any
 
@@ -10,6 +11,10 @@ from .errors import KRInvalidLocator, KRLimitExceeded, KRNotFound, KRStaleLocato
 from .memory_provider import MemoryProvider
 from .models import Evidence, Locator, ReadOptions, SearchHit, SearchOptions, MAX_PAGE_SIZE
 from .retrieval import LocalNgramEncoder, SemanticEncoder, cosine_similarity, reciprocal_rank_fusion
+
+
+_VECTOR_CACHE_SIZE = 10_000
+_LOCAL_NGRAM_MIN_SIMILARITY = 0.12
 
 
 class AssetKnowledgeProvider(MemoryProvider):
@@ -23,6 +28,8 @@ class AssetKnowledgeProvider(MemoryProvider):
     ) -> None:
         self.store = store
         self.semantic_encoder = semantic_encoder if semantic_encoder is not None else LocalNgramEncoder()
+        self._semantic_vector_cache: OrderedDict[str, Any] = OrderedDict()
+        self._semantic_vector_cache_size = _VECTOR_CACHE_SIZE
         self._assets = {}
         super().__init__({}, provider_id="knowledge-assets")
         if not hasattr(store, "search_current"):
@@ -69,21 +76,14 @@ class AssetKnowledgeProvider(MemoryProvider):
                 scope=scope,
                 limit=MAX_PAGE_SIZE,
             )
-            chunks = self.store.list_current_chunks(scope=scope)
+            def has_case_sensitive_term(chunk) -> bool:
+                searchable = " ".join((chunk.source_name, *chunk.heading_path, chunk.text))
+                return query in searchable
+
             if options.case_sensitive:
-                terms = re.findall(r"\w+", query)
-
-                def has_case_sensitive_term(chunk) -> bool:
-                    searchable = " ".join((chunk.source_name, *chunk.heading_path, chunk.text))
-                    return any(
-                        re.search(rf"(?<!\w){re.escape(term)}(?!\w)", searchable)
-                        for term in terms
-                    )
-
                 lexical_candidates = [
                     item for item in lexical_candidates if has_case_sensitive_term(item[0])
                 ]
-                chunks = [chunk for chunk in chunks if has_case_sensitive_term(chunk)]
 
             lexical_ranked = [
                 chunk
@@ -92,24 +92,107 @@ class AssetKnowledgeProvider(MemoryProvider):
                     key=lambda item: (-item[1], item[0].chunk_id),
                 )
             ]
-            query_vector = self.semantic_encoder.encode(query)
+            semantic_ranked = []
+            if options.semantic_weight > 0.0:
+                query_vector = self.semantic_encoder.encode(query)
+            else:
+                query_vector = None
+            if (
+                query_vector is not None
+                and isinstance(self.semantic_encoder, LocalNgramEncoder)
+                and hasattr(self.store, "has_current_chunk_vector_index")
+                and self.store.has_current_chunk_vector_index(
+                    self.semantic_encoder.encoder_id,
+                    scope=scope,
+                )
+            ):
+                chunks = self.store.list_current_chunks(scope=scope)
+                if options.case_sensitive:
+                    chunks = [chunk for chunk in chunks if has_case_sensitive_term(chunk)]
+                semantic_candidates = []
+                if len(chunks) <= self._semantic_vector_cache_size:
+                    missing_ids = {
+                        chunk.chunk_id
+                        for chunk in chunks
+                        if chunk.chunk_id not in self._semantic_vector_cache
+                    }
+                    if missing_ids:
+                        for chunk, vector in self.store.list_current_chunks_with_vectors(
+                            encoder_id=self.semantic_encoder.encoder_id,
+                            scope=scope,
+                        ):
+                            if chunk.chunk_id in missing_ids:
+                                self._remember_chunk_vector(chunk.chunk_id, vector)
+                    for chunk in chunks:
+                        vector = self._semantic_vector_cache.get(chunk.chunk_id)
+                        if vector is None:
+                            vector = self._chunk_vector(
+                                chunk,
+                                "\n".join((*chunk.heading_path, chunk.text)),
+                            )
+                        semantic_candidates.append(
+                            (chunk, cosine_similarity(query_vector, vector))
+                        )
+                else:
+                    # Keep the reusable vector cache bounded for large stores.
+                    # This exact ranker still scans and materializes all chunks
+                    # and scores, so its temporary working set grows with N.
+                    for start in range(0, len(chunks), MAX_PAGE_SIZE):
+                        batch = chunks[start : start + MAX_PAGE_SIZE]
+                        vectors = {
+                            chunk.chunk_id: vector
+                            for chunk, vector in self.store.list_current_chunks_with_vectors(
+                                encoder_id=self.semantic_encoder.encoder_id,
+                                chunk_ids=[chunk.chunk_id for chunk in batch],
+                            )
+                        }
+                        for chunk in batch:
+                            vector = (
+                                self._semantic_vector_cache.get(chunk.chunk_id)
+                                or vectors.get(chunk.chunk_id)
+                            )
+                            if vector is None:
+                                vector = self.semantic_encoder.encode(
+                                    "\n".join((*chunk.heading_path, chunk.text))
+                                )
+                            semantic_candidates.append(
+                                (chunk, cosine_similarity(query_vector, vector))
+                            )
+                semantic_ranked = [
+                    chunk
+                    for chunk, score in sorted(
+                        semantic_candidates,
+                        key=lambda item: (-item[1], item[0].chunk_id),
+                    )
+                    if score >= _LOCAL_NGRAM_MIN_SIMILARITY
+                ][:MAX_PAGE_SIZE]
+            elif query_vector is not None:
+                chunks = self.store.list_current_chunks(scope=scope)
+                if options.case_sensitive:
+                    chunks = [chunk for chunk in chunks if has_case_sensitive_term(chunk)]
+                # Injected or custom-dimension encoders have no matching
+                # persistent index. Preserve semantic-only recall by scanning
+                # current chunks; their vectors remain bounded by the LRU.
+                def searchable_text(chunk) -> str:
+                    return "\n".join((*chunk.heading_path, chunk.text))
 
-            def searchable_text(chunk) -> str:
-                # Filename matching already contributes to the FTS channel;
-                # keep the local vector focused on the evidence and its headings.
-                return "\n".join((*chunk.heading_path, chunk.text))
-
-            semantic_candidates = [
-                (chunk, cosine_similarity(query_vector, self.semantic_encoder.encode(searchable_text(chunk))))
-                for chunk in chunks
-            ]
-            semantic_ranked = [
-                chunk
-                for chunk, score in sorted(
-                    (item for item in semantic_candidates if item[1] > 0.0),
-                    key=lambda item: (-item[1], item[0].chunk_id),
-                )[:MAX_PAGE_SIZE]
-            ]
+                semantic_candidates = [
+                    (
+                        chunk,
+                        cosine_similarity(
+                            query_vector,
+                            self._chunk_vector(chunk, searchable_text(chunk)),
+                        ),
+                    )
+                    for chunk in chunks
+                ]
+                semantic_ranked = [
+                    chunk
+                    for chunk, _score in sorted(
+                        (item for item in semantic_candidates if item[1] > 0.0),
+                        key=lambda item: (-item[1], item[0].chunk_id),
+                    )[:MAX_PAGE_SIZE]
+                ]
             ranked_chunks = reciprocal_rank_fusion(
                 lexical_ranked,
                 semantic_ranked,
@@ -275,6 +358,21 @@ class AssetKnowledgeProvider(MemoryProvider):
     def _cache_asset(self, asset) -> None:
         self._assets[asset.asset_id] = asset
         self._resources[asset.asset_id] = self._resource_from_asset(asset)
+
+    def _chunk_vector(self, chunk, text: str):
+        vector = self._semantic_vector_cache.get(chunk.chunk_id)
+        if vector is not None:
+            self._semantic_vector_cache.move_to_end(chunk.chunk_id)
+            return vector
+        vector = self.semantic_encoder.encode(text)
+        self._remember_chunk_vector(chunk.chunk_id, vector)
+        return vector
+
+    def _remember_chunk_vector(self, chunk_id: str, vector: Any) -> None:
+        self._semantic_vector_cache[chunk_id] = vector
+        self._semantic_vector_cache.move_to_end(chunk_id)
+        if len(self._semantic_vector_cache) > self._semantic_vector_cache_size:
+            self._semantic_vector_cache.popitem(last=False)
 
     @staticmethod
     def _normalize_window_token(token: str) -> str:
