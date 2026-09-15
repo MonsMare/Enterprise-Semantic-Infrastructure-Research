@@ -14,7 +14,7 @@ python -m pip install -e ".[dev,pdf]"
 
 ```powershell
 $env:MINERU_API_KEY = "<rotated MinerU token>"
-$env:LLM_API_KEY = "<rotated LLM key>"
+$env:QWEN_LLM_API_KEY = "<rotated Qwen key>"
 $env:LLM_BASE_URL = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
 $env:LLM_MODEL = "qwen3.8-max"
 ```
@@ -62,7 +62,7 @@ SQLite 会事务化保存当前资产、每次 source revision、解析器 prove
 
 精算公开文档目录位于 `benchmarks/actuarial/public_sources.jsonl`，涵盖 ASB、CAS、SOA、NAIC、EIOPA 和 GAD。目录保存官方来源地址和评测元数据；下载清单记录来源、抓取时间和 SHA-256。文档保存在 `.kr-data/`，不会进入 Git。下载前应核对来源机构的许可和使用条款。
 
-Benchmark JSONL 按预期来源、回答关键短语和 Evidence 必含原文短语评分。报告分别给出来源排名与证据片段排名、Evidence 定位率、Hit@1/3、MRR、端到端 p50/p95、search/read 用时和 Evidence 字节数。要跑真实 Qwen 评测，需先在本机设置 `LLM_API_KEY`；测试套件使用 ScriptedModel，不会发起模型 API 调用。本轮离线迭代结果和限制见[混合检索评测报告](docs/reports/2026-09-14-hybrid-retrieval-results.md)。
+Benchmark JSONL 按预期来源、回答关键短语和 Evidence 必含原文短语评分。报告分别给出来源排名与证据片段排名、Evidence 定位率、Hit@1/3、MRR、端到端 p50/p95、search/read 用时和 Evidence 字节数。要跑真实 Qwen 评测，需先在本机设置 `QWEN_LLM_API_KEY`（兼容旧变量 `LLM_API_KEY`）；测试套件使用 ScriptedModel，不会发起模型 API 调用。本轮离线迭代结果和限制见[混合检索评测报告](docs/reports/2026-09-14-hybrid-retrieval-results.md)，规模化选型见[规模化方案与可复用组件](docs/reports/2026-09-14-industry-scaling-options.md)。
 
 模糊、简短和不完整的用户表达使用独立数据集验证：
 

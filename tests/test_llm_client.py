@@ -57,7 +57,17 @@ def test_client_defaults_to_qwen_for_agent_runtime(monkeypatch):
 
 def test_client_requires_key_without_echoing_it(monkeypatch):
     monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("QWEN_LLM_API_KEY", raising=False)
     client = OpenAICompatibleClient(api_key="", model="deepseek-v4.1-flash")
 
-    with pytest.raises(KRProviderUnavailable, match="LLM_API_KEY"):
+    with pytest.raises(KRProviderUnavailable, match="QWEN_LLM_API_KEY"):
         client.complete([], [])
+
+
+def test_client_accepts_qwen_specific_environment_key(monkeypatch):
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setenv("QWEN_LLM_API_KEY", "qwen-only-secret")
+
+    client = OpenAICompatibleClient(model="qwen3.8-max")
+
+    assert client.api_key == "qwen-only-secret"

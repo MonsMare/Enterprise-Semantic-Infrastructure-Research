@@ -34,7 +34,9 @@ class OpenAICompatibleClient:
         model: str | None = None,
         timeout: float = 90.0,
     ) -> None:
-        self.api_key = api_key or os.environ.get("LLM_API_KEY", "")
+        # Keep the generic name for existing deployments, while allowing the
+        # Qwen Agent benchmark to use its dedicated secret directly.
+        self.api_key = api_key or os.environ.get("QWEN_LLM_API_KEY") or os.environ.get("LLM_API_KEY", "")
         self.base_url = (base_url or os.environ.get("LLM_BASE_URL", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")).rstrip("/")
         self.model = model or os.environ.get("LLM_MODEL", "qwen3.8-max")
         self.timeout = timeout
@@ -43,7 +45,7 @@ class OpenAICompatibleClient:
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelTurn:
         if not self.api_key:
-            raise KRProviderUnavailable("LLM_API_KEY is not set")
+            raise KRProviderUnavailable("QWEN_LLM_API_KEY or LLM_API_KEY is not set")
         # An empty tool list is an explicit end-of-retrieval turn.  Keeping
         # ``auto`` here lets some compatible servers replay a tool call from
         # the conversation even though no tools are offered, which can make

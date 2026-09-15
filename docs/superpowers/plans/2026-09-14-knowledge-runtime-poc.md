@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Never store or print API keys; read `MINERU_API_KEY`, `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` only from the environment.
+- Never store or print API keys; read `MINERU_API_KEY`, `QWEN_LLM_API_KEY` (with legacy `LLM_API_KEY` fallback), `LLM_BASE_URL`, and `LLM_MODEL` only from the environment.
 - Keep the mandatory KR surface to `list`, `find`, `search`, `read`, and `stat`.
 - Search results are hints; only Read returns Evidence.
 - Every SearchHit must contain a replayable Locator with revision and selector.

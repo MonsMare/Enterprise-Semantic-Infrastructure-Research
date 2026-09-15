@@ -48,14 +48,14 @@ evidence rank separately, reads expected evidence, checks evidence phrases,
 and records latency and evidence size. The latest offline iteration report is
 [`docs/reports/2026-09-14-hybrid-retrieval-results.md`](../../docs/reports/2026-09-14-hybrid-retrieval-results.md).
 The separate `benchmark` command runs the Qwen 3.8 Agent Retrieval Loop when
-`LLM_API_KEY` is configured.
+`QWEN_LLM_API_KEY` (or the legacy `LLM_API_KEY`) is configured.
 
 ## 模糊问法与弱查询评测
 
 `questions-fuzzy.jsonl` 收录了中文口语化、简短、多语言和上下文不足的精算问题。
 `benchmark` 会把原始问题交给 Agent，再记录它实际发出的每条搜索语句、首轮与最佳
 来源排名、是否读取到金标准来源、回答是否包含金标准短语，以及 Evidence 引用情况。
-该命令固定使用 Qwen 3.8，并需要配置 `LLM_API_KEY`：
+该命令固定使用 Qwen 3.8，并需要配置 `QWEN_LLM_API_KEY`（兼容旧变量 `LLM_API_KEY`）：
 
 ```powershell
 python -m knowledge_runtime.cli benchmark .\benchmarks\actuarial\questions-fuzzy.jsonl --store .kr-data\actuarial.db --model qwen3.8-max --output .kr-data\actuarial-fuzzy-agent-report.json
