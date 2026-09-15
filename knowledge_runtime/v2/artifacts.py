@@ -8,7 +8,14 @@ from .contracts import ArtifactRef, object_name
 
 
 def artifact_key(document_id: str, revision_id: str, name: str) -> str:
-    return f"documents/{document_id}/revisions/{revision_id}/{object_name(name)}"
+    return f"documents/{_safe_component(document_id)}/revisions/{_safe_component(revision_id)}/{object_name(name)}"
+
+
+def _safe_component(value: str) -> str:
+    component = str(value).replace("\\", "/")
+    if not component or component in {".", ".."} or "/" in component:
+        raise ValueError("artifact identity components must be single safe path components")
+    return component
 
 
 class ArtifactStore(Protocol):
@@ -141,4 +148,3 @@ class S3ArtifactStore:
         if retention_token != "ALLOW_RETENTION_DELETE":
             raise PermissionError("artifact deletion requires an explicit retention token")
         self.client.delete_object(Bucket=self.bucket, Key=ref.object_key)
-

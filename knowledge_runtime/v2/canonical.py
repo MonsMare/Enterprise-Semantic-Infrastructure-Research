@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
-from .contracts import DocumentElement, DocumentIR, DocumentRevision, EvidenceRef, ParseReport
+from .contracts import ArtifactRef, DocumentElement, DocumentIR, DocumentRevision, EvidenceRef, ParseReport
 
 
 def _now() -> str:
@@ -278,6 +278,26 @@ class PostgresCanonicalStore:
                             element.content_hash,
                         ),
                     )
+                for artifact in ir.source_artifacts:
+                    cursor.execute(
+                        """
+                        INSERT INTO artifact_refs
+                        (artifact_id, document_id, revision_id, object_key, media_type,
+                         sha256, size_bytes, kind)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (artifact_id) DO NOTHING
+                        """,
+                        (
+                            artifact.artifact_id,
+                            ir.document_id,
+                            ir.revision_id,
+                            artifact.object_key,
+                            artifact.media_type,
+                            artifact.sha256,
+                            artifact.size_bytes,
+                            artifact.kind,
+                        ),
+                    )
 
     def find_revision_by_source_hash(self, source_hash: str) -> DocumentRevision | None:
         with self.connection.cursor() as cursor:
@@ -301,6 +321,69 @@ class PostgresCanonicalStore:
         if not row:
             raise KeyError(f"unknown revision {document_id}/{revision_id}")
         return _revision_from_row(row)
+
+    def get_element(self, document_id: str, revision_id: str, element_id: str) -> DocumentElement:
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT element_id, revision_id, element_type, text, section_path, page, bbox, "
+                "payload_json, provenance_json, confidence, content_hash FROM document_elements "
+                "WHERE document_id=%s AND revision_id=%s AND element_id=%s",
+                (document_id, revision_id, element_id),
+            )
+            row = cursor.fetchone()
+        if not row:
+            raise KeyError(f"unknown element {element_id}")
+        return _element_from_row(row)
+
+    def get_ir(self, document_id: str, revision_id: str) -> DocumentIR:
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT metadata_json FROM document_revisions WHERE document_id=%s AND revision_id=%s",
+                (document_id, revision_id),
+            )
+            revision_row = cursor.fetchone()
+            if not revision_row:
+                raise KeyError(f"unknown revision {document_id}/{revision_id}")
+            cursor.execute(
+                "SELECT element_id, revision_id, element_type, text, section_path, page, bbox, "
+                "payload_json, provenance_json, confidence, content_hash FROM document_elements "
+                "WHERE document_id=%s AND revision_id=%s ORDER BY page NULLS FIRST, element_id",
+                (document_id, revision_id),
+            )
+            element_rows = cursor.fetchall()
+            cursor.execute(
+                "SELECT report_json FROM parse_reports WHERE document_id=%s AND revision_id=%s",
+                (document_id, revision_id),
+            )
+            report_row = cursor.fetchone()
+            cursor.execute(
+                "SELECT artifact_id, object_key, media_type, sha256, size_bytes, kind, revision_id "
+                "FROM artifact_refs WHERE document_id=%s AND revision_id=%s ORDER BY object_key",
+                (document_id, revision_id),
+            )
+            artifact_rows = cursor.fetchall()
+        metadata = revision_row[0] if isinstance(revision_row[0], dict) else json.loads(revision_row[0] or "{}")
+        report_data = report_row[0] if report_row and isinstance(report_row[0], dict) else json.loads(report_row[0] if report_row else "{}")
+        report = _report_from_json(report_data)
+        return DocumentIR(
+            document_id=document_id,
+            revision_id=revision_id,
+            metadata=metadata,
+            elements=tuple(_element_from_row(row) for row in element_rows),
+            parse_report=report,
+            source_artifacts=tuple(
+                ArtifactRef(
+                    artifact_id=str(row[0]),
+                    object_key=str(row[1]),
+                    media_type=str(row[2]),
+                    sha256=str(row[3]),
+                    size_bytes=int(row[4]),
+                    kind=str(row[5]),
+                    revision_id=str(row[6]),
+                )
+                for row in artifact_rows
+            ),
+        )
 
     def current_revision(self, document_id: str) -> str | None:
         with self.connection.cursor() as cursor:
@@ -428,3 +511,51 @@ def _report_json(report: ParseReport) -> dict[str, Any]:
         "egress_allowed": report.egress_allowed,
     }
 
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, (dict, list, tuple)):
+        return value
+    if value is None:
+        return {}
+    return json.loads(value)
+
+
+def _element_from_row(row: Any) -> DocumentElement:
+    values = list(row)
+    section_path = values[4] or ()
+    bbox = values[6]
+    return DocumentElement(
+        element_id=str(values[0]),
+        revision_id=str(values[1]),
+        element_type=str(values[2]),  # type: ignore[arg-type]
+        text=str(values[3]),
+        section_path=tuple(section_path),
+        page=int(values[5]) if values[5] is not None else None,
+        bbox=tuple(float(item) for item in bbox) if bbox else None,
+        payload=_json_value(values[7]),
+        provenance=_json_value(values[8]),
+        confidence=float(values[9]) if values[9] is not None else None,
+        content_hash=str(values[10]),
+    )
+
+
+def _report_from_json(value: dict[str, Any]) -> ParseReport:
+    if not value:
+        return ParseReport.empty("postgres", "unknown")
+    return ParseReport(
+        document_type=str(value.get("document_type", "unknown")),
+        page_count=int(value.get("page_count", 0)),
+        text_coverage=float(value.get("text_coverage", 0.0)),
+        layout_quality=float(value.get("layout_quality", 0.0)),
+        ocr_quality=float(value.get("ocr_quality", 0.0)),
+        table_quality=float(value.get("table_quality", 0.0)),
+        reading_order_quality=float(value.get("reading_order_quality", 0.0)),
+        missing_regions=tuple(value.get("missing_regions", ())),
+        suspicious_regions=tuple(value.get("suspicious_regions", ())),
+        parser_name=str(value.get("parser_name", "postgres")),
+        parser_version=str(value.get("parser_version", "unknown")),
+        overall_grade=str(value.get("overall_grade", "unknown")),  # type: ignore[arg-type]
+        warnings=tuple(str(item) for item in value.get("warnings", ())),
+        provider_name=value.get("provider_name"),
+        egress_allowed=bool(value.get("egress_allowed", False)),
+    )

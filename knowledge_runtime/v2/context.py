@@ -110,12 +110,13 @@ class ContextRuntime:
         limit: int = 20,
         cursor: str | None = None,
     ) -> AssetSearchPage:
+        started = time.perf_counter()
         page = self.index.search_assets(AssetSearchRequest(query=query, filters=filters, limit=limit, cursor=cursor))
         self._record(
             primitive="search_assets",
             query=query,
             refs=(),
-            started=time.perf_counter(),
+            started=started,
             outcome="OK",
             diagnostics=page.diagnostics,
         )
@@ -210,4 +211,3 @@ class ContextRuntime:
                 outcome=record.outcome,
                 diagnostics=record.diagnostics,
             )
-

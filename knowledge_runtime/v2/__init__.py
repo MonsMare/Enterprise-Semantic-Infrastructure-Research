@@ -13,6 +13,8 @@ from .contracts import (
     BusinessTerm,
     content_hash,
 )
+from .config import RuntimeConfig
+from .context import ContextRuntime, RetrievalBudget
 
 __all__ = [
     "ArtifactRef",
@@ -25,6 +27,8 @@ __all__ = [
     "Entity",
     "Metadata",
     "ParseReport",
+    "RuntimeConfig",
+    "ContextRuntime",
+    "RetrievalBudget",
     "content_hash",
 ]
-
