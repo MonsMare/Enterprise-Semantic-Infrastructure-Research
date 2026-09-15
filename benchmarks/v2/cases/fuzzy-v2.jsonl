@@ -1,0 +1,4 @@
+# Fuzzy and underspecified prompts are intentionally measured separately from gold retrieval.
+{"case_id":"fuzzy-asop23-001","question":"那个别人给的数据，标准到底要求我怎么处理？","retrieval_query":"data supplied by others review","query_style":"fuzzy","expected_sources":["asop-23-data-quality.pdf"],"answerable":true}
+{"case_id":"short-asop56-001","question":"模型的适用范围？","retrieval_query":"scope applies practice area models","query_style":"short","expected_sources":["asop-56-modeling.pdf"],"answerable":true}
+{"case_id":"ambiguous-follow-up-001","question":"那它呢？","query_style":"ambiguous","expected_sources":[],"answerable":false,"expected_action":"clarification"}

@@ -1,0 +1,4 @@
+{"case_id":"scale-20","document_count":20,"query":"reserve margin","expected_property":"incremental"}
+{"case_id":"scale-100","document_count":100,"query":"reserve margin","expected_property":"incremental"}
+{"case_id":"scale-1000","document_count":1000,"query":"reserve margin","expected_property":"incremental"}
+{"case_id":"scale-5000","document_count":5000,"query":"reserve margin","expected_property":"incremental"}
