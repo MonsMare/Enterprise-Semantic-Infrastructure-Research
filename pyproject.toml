@@ -10,8 +10,11 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "PyYAML>=6"]
 pdf = ["pypdf>=5"]
+runtime = ["psycopg[binary]>=3.2", "boto3>=1.35", "opensearch-py>=2.7"]
+local-parser = ["docling>=2.0", "unstructured>=0.15"]
+semantic = ["neo4j>=5.0"]
 
 [tool.setuptools.packages.find]
 include = ["knowledge_runtime*"]
