@@ -25,6 +25,7 @@
 - Local private mode performs no external model or parser request unless explicitly enabled by configuration.
 - Docker commands must use `docker compose -p kr-v2` and resource names prefixed with `kr-v2-`; no global prune, stop, remove, or network/volume operation is allowed.
 - The Agent gateway uses `QWEN_LLM_API_KEY` with model `qwen3.8-max`; the embedding gateway uses `DASHSCOPE_API_KEY` with model `qwen3.7-text-embedding` only.
+- Cloud Agent calls are disabled by default in private mode and require explicit `KR_ALLOW_REMOTE_AGENT=true`; the POC may enable this flag for the supplied cloud Qwen resource.
 - The POC does not add authentication, tenant isolation, billing, management UI, or a mutable LLM-generated enterprise Ontology.
 
 ## File Map
@@ -33,8 +34,10 @@ Create the v2 implementation as a focused subpackage so the existing POC remains
 
 - `knowledge_runtime/v2/contracts.py`: immutable DocumentIR, Evidence, search, index, and proposal value objects.
 - `knowledge_runtime/v2/config.py`: environment-backed runtime configuration and strict model/key policy.
+- `knowledge_runtime/v2/model_gateway.py`: provider-neutral model gateway plus local OpenAI-compatible gateway seam; cloud Qwen remains an explicit POC option.
 - `knowledge_runtime/v2/providers.py`: `LocalProvider`, `MinerUProvider`, parser router, and provider normalization.
 - `knowledge_runtime/v2/quality.py`: ParseReport thresholds and QualityGate decisions.
+- `knowledge_runtime/v2/chunking.py`: versioned ChunkSet derivation from canonical Elements, including parent/neighbor provenance.
 - `knowledge_runtime/v2/artifacts.py`: ArtifactStore protocol plus filesystem test store and S3/MinIO implementation.
 - `knowledge_runtime/v2/canonical.py`: CanonicalStore protocol, in-memory contract store, and PostgreSQL implementation.
 - `knowledge_runtime/v2/migrations/001_initial.sql`: PostgreSQL tables, indexes, constraints, and publication transaction helpers.
@@ -43,16 +46,20 @@ Create the v2 implementation as a focused subpackage so the existing POC remains
 - `knowledge_runtime/v2/ingestion.py`: idempotent ingestion state machine and revision publication.
 - `knowledge_runtime/v2/semantic.py`: proposal lifecycle, Neo4j adapter, OpenMetadata adapter, and enrichment worker.
 - `knowledge_runtime/v2/context.py`: five Context Runtime primitives, bounded budgets, and context-run telemetry.
+- `knowledge_runtime/v2/query_planner.py`: conversation-aware query normalization, rewrite budgets, ambiguity detection, and query-plan telemetry.
 - `knowledge_runtime/v2/agent.py`: strict Qwen Agent gateway, five-tool retrieval loop, and citation validator.
 - `knowledge_runtime/v2/compat.py`: adapter from legacy `KnowledgeProvider`/`Locator` objects to v2 primitives.
 - `knowledge_runtime/v2/cli.py`: v2 CLI commands; existing `knowledge_runtime/cli.py` remains compatible.
 - `knowledge_runtime/v2/migration.py`: replay of existing SQLite assets into CanonicalStore and ArtifactStore.
 - `deploy/kr-v2.compose.yml`, `deploy/kr-v2.env.example`, `deploy/README.md`: scoped private deployment.
+- `deploy/Dockerfile`: reproducible KR API/worker image used only by the KR Compose project.
 - `scripts/kr-v2.ps1`: Windows-safe, project-scoped Docker operations.
 - `benchmarks/v2/run_benchmark.py` and `benchmarks/v2/cases/*.jsonl`: evidence, Agent, scale, revision, and private-egress benchmarks.
 - `tests/v2/`: unit and contract tests; Docker and external-service tests are explicitly opt-in.
 
 Every task below ends with a focused test run and a separate commit. Later tasks consume only the interfaces named in earlier tasks.
+
+The execution gate is deliberately staged: Tasks 1–5, 7–8, and the `core` part of Task 9 form the POC critical path (L1 plus L3). Task 6 and the `semantic`/`governance` Compose profiles are optional after the core path passes the acceptance targets; their outage must never block L1 ingestion, Evidence reads, or the five Context Runtime primitives.
 
 ---
 
@@ -62,14 +69,16 @@ Every task below ends with a focused test run and a separate commit. Later tasks
 - Create: `knowledge_runtime/v2/__init__.py`
 - Create: `knowledge_runtime/v2/contracts.py`
 - Create: `knowledge_runtime/v2/config.py`
+- Create: `knowledge_runtime/v2/model_gateway.py`
 - Create: `tests/v2/test_contracts.py`
 - Create: `tests/v2/test_config.py`
 - Modify: `pyproject.toml` to add the `runtime` optional dependency group and `PyYAML` to development tools without making external services mandatory for the legacy POC.
 
 **Interfaces:**
-- Produces `DocumentIR`, `DocumentElement`, `ParseReport.empty()`, `ArtifactRef`, `EvidenceRef`, `Evidence`, `content_hash`, `EvidenceFilters`, `AssetFilters`, `EvidenceSearchRequest`, `AssetSearchRequest`, `SearchHitV2`, `EvidenceSearchPage`, `AssetSearchPage`, `DocumentRevision`, `RevisionIndexInput.from_ir()`, `IndexPublishResult`, `IndexRebuildRequest`, `IndexBuildReport`, `ProposalStatus`, and `SemanticProposal`.
-- Produces `RuntimeConfig.from_env()` with `private_mode`, provider flags, storage endpoints, `embedding_model="qwen3.7-text-embedding"`, and `agent_model="qwen3.8-max"`.
-- Produces `RuntimeConfig.test_private(**overrides)` for deterministic tests; it sets both remote flags to `False` and never reads secrets from the process environment.
+- Produces `DocumentIR`, `DocumentElement`, `ParseReport.empty()`, `ArtifactRef`, `EvidenceRef`, `Evidence`, `content_hash`, `Entity`, `Claim`, `BusinessTerm`, `Metadata`, `EvidenceFilters`, `AssetFilters`, `EvidenceSearchRequest`, `AssetSearchRequest`, `SearchHitV2`, `EvidenceSearchPage`, `AssetSearchPage`, `DocumentRevision`, `RevisionIndexInput.from_ir()`, `IndexPublishResult`, `IndexRebuildRequest`, `IndexBuildReport`, `ProposalStatus`, and `SemanticProposal`.
+- Produces `RuntimeConfig.from_env()` with `private_mode`, parser/embedding/Agent egress flags, storage endpoints, `embedding_model="qwen3.7-text-embedding"`, and `agent_model="qwen3.8-max"`.
+- Produces `RuntimeConfig.test_private(**overrides)` for deterministic tests; it sets all remote flags to `False` and never reads secrets from the process environment.
+- Produces `ModelGateway` and `LocalModelGateway`; local parsing/enrichment can receive a local OpenAI-compatible endpoint without changing the Provider or Evidence contracts.
 - Later tasks import these types and must not duplicate their fields.
 
 - [ ] **Step 1: Write failing contract tests**
@@ -116,13 +125,16 @@ def from_env(cls) -> "RuntimeConfig":
     return cls(
         private_mode=_bool_env("KR_PRIVATE_MODE", True),
         allow_remote_parser=_bool_env("KR_ALLOW_REMOTE_PARSER", False),
-        allow_remote_embedding=_bool_env("KR_ALLOW_REMOTE_EMBEDDING", True),
+        allow_remote_embedding=_bool_env("KR_ALLOW_REMOTE_EMBEDDING", False),
+        allow_remote_agent=_bool_env("KR_ALLOW_REMOTE_AGENT", False),
         embedding_model="qwen3.7-text-embedding",
         agent_model="qwen3.8-max",
         agent_api_key=os.environ.get("QWEN_LLM_API_KEY", ""),
         embedding_api_key=os.environ.get("DASHSCOPE_API_KEY", ""),
         agent_base_url=os.environ.get("QWEN_LLM_BASE_URL", ""),
         embedding_base_url=os.environ.get("DASHSCOPE_BASE_URL", ""),
+        local_model_base_url=os.environ.get("KR_LOCAL_MODEL_BASE_URL", ""),
+        local_model_name=os.environ.get("KR_LOCAL_MODEL_NAME", ""),
     )
 ```
 
@@ -142,10 +154,13 @@ Expected: all v2 contract and key-separation tests pass. Commit with `git add kn
 - Create: `tests/v2/test_providers.py`
 - Create: `tests/v2/test_quality.py`
 - Modify: `knowledge_runtime/mineru_backend.py` only where a typed result or egress policy hook is needed; preserve its existing transport tests.
+- Modify: `pyproject.toml` to expose `docling` and `unstructured` in separate optional local-parser extras; the default legacy install remains lightweight.
 
 **Interfaces:**
 - Consumes `DocumentIR`, `RuntimeConfig`, and existing `LocalExtractionBackend`/`MinerUCloudBackend`.
 - Produces `ParserProvider.parse(source, *, document_id, revision_id) -> DocumentIR`, `LocalProvider`, `MinerUProvider`, `ParserRouter`, `QualityDecision`, and `QualityGate.evaluate(report) -> QualityDecision`.
+- `LocalProvider` tries `DoclingProvider` first, uses `UnstructuredProvider` for configured high-resolution/VLM fallback, and uses the existing deterministic text parser only for plain-text-compatible formats or an explicitly configured degraded mode.
+- `LocalProvider` accepts an optional `ModelGateway`; the POC default is parser-only, while a future local VLM/LLM endpoint can be enabled without sending document content to MinerU or Qwen.
 - Provider output contains no parser-specific object after normalization.
 
 - [ ] **Step 1: Write failing provider and gate tests**
@@ -184,7 +199,7 @@ Expected: failures for missing provider classes and `QualityGate`.
 
 - [ ] **Step 3: Implement the common provider boundary**
 
-Convert the existing local asset result into `DocumentElement` records for headings, paragraphs, lists, tables, pictures, formulas, code, headers, and footers when the parser exposes those types. Preserve line/page/bbox information in `provenance` and keep the original structured payload in `payload`. The fallback text parser must still produce a valid `DocumentIR` when Docling is unavailable.
+Implement `DoclingProvider` as the primary local parser and `UnstructuredProvider` as the configured high-resolution/VLM fallback. Convert parser output into `DocumentElement` records for headings, paragraphs, lists, tables, pictures, formulas, code, headers, and footers. Preserve line/page/bbox information in `provenance` and keep the original structured payload in `payload`. The existing deterministic text parser is limited to plain-text-compatible formats or an explicitly configured degraded mode; a PDF/image parse must not silently lose layout quality because an optional dependency is absent.
 
 ```python
 class ParserProvider(Protocol):
@@ -201,9 +216,9 @@ def markdown_to_ir(markdown: str, *, document_id: str, revision_id: str, parser:
     )
 ```
 
-- [ ] **Step 4: Implement `MinerUProvider` and `ParserRouter`**
+- [ ] **Step 4: Implement `MinerUProvider`, `LocalModelGateway`, and `ParserRouter`**
 
-Wrap `MinerUCloudBackend` and normalize its Markdown/content-list/archive artifacts into the same `DocumentIR`. The router records provider name, parser version, endpoint policy, and egress decision in `ParseReport`. A remote retry is allowed only when `allow_remote_parser=True`; private mode never implicitly falls back from local to remote.
+Wrap `MinerUCloudBackend` and normalize its Markdown/content-list/archive artifacts into the same `DocumentIR`. `LocalModelGateway` is OpenAI-compatible but points only at an explicitly configured local endpoint and has no cloud fallback. The router records provider name, parser version, endpoint policy, and egress decision in `ParseReport`. A remote retry is allowed only when `allow_remote_parser=True`; private mode never implicitly falls back from local to remote.
 
 - [ ] **Step 5: Implement QualityGate and run tests**
 
@@ -223,13 +238,15 @@ def evaluate(self, report: ParseReport) -> QualityDecision:
 **Files:**
 - Create: `knowledge_runtime/v2/canonical.py`
 - Create: `knowledge_runtime/v2/artifacts.py`
+- Create: `knowledge_runtime/v2/schema.py`
 - Create: `knowledge_runtime/v2/migrations/001_initial.sql`
 - Create: `tests/v2/test_canonical.py`
 - Create: `tests/v2/test_artifacts.py`
 - Modify: `pyproject.toml` runtime dependencies for `psycopg[binary]` and `boto3`.
 
 **Interfaces:**
-- Produces `CanonicalStore` with `put_revision`, `get_revision`, `get_element`, `current_revision`, `begin_publication`, `publish_current`, `record_ingestion_job`, `record_index_run`, `record_context_run`, `list_current_documents`, and `list_revisions(document_id)`.
+- Produces `CanonicalStore` with `put_revision`, `find_revision_by_source_hash`, `get_revision`, `get_element`, `current_revision`, `begin_publication`, `publish_current`, `record_ingestion_job`, `record_index_run`, `record_context_run`, `list_current_documents`, and `list_revisions(document_id)`.
+- Produces `SchemaMigrator.apply()` with a version table and transactional SQL application; the CLI invokes this before any v2 ingestion.
 - Produces `ArtifactStore` with `put_bytes`, `get_bytes`, `head`, and `delete` (delete requires an explicit retention operation).
 - Produces `PostgresCanonicalStore`, `InMemoryCanonicalStore`, `S3ArtifactStore`, and `FilesystemArtifactStore`.
 
@@ -240,6 +257,7 @@ def test_current_revision_is_not_published_before_index_success(store, sample_ir
     store.put_revision(sample_ir, source_hash="src-1")
     store.begin_publication(sample_ir.document_id, sample_ir.revision_id, index_version="idx-1")
     assert store.current_revision(sample_ir.document_id) is None
+    store.record_index_run("idx-1", state="SUCCEEDED")
     store.publish_current(sample_ir.document_id, sample_ir.revision_id, index_version="idx-1")
     assert store.current_revision(sample_ir.document_id) == sample_ir.revision_id
 
@@ -285,7 +303,7 @@ def publish_current(self, document_id: str, revision_id: str, *, index_version: 
 
 - [ ] **Step 4: Implement stores and hash-preserving artifact writes**
 
-`PostgresCanonicalStore` uses parameterized SQL only and never stores document bodies in logs. `S3ArtifactStore` writes immutable keys under `documents/{document_id}/revisions/{revision_id}/{artifact_name}`, verifies SHA-256 on read, and uses MinIO-compatible endpoint configuration. `FilesystemArtifactStore` is a deterministic test/local adapter and does not replace the PostgreSQL production path.
+`PostgresCanonicalStore` uses parameterized SQL only and never stores document bodies in logs. `SchemaMigrator` applies numbered SQL files exactly once and records the applied version. `S3ArtifactStore` writes immutable keys under `documents/{document_id}/revisions/{revision_id}/{artifact_name}`, verifies SHA-256 on read, and rejects an existing key whose hash differs. `FilesystemArtifactStore` is a deterministic test/local adapter and does not replace the PostgreSQL production path.
 
 ```python
 def artifact_key(document_id: str, revision_id: str, name: str) -> str:
@@ -308,13 +326,16 @@ Expected: contract tests pass against `InMemoryCanonicalStore` and `FilesystemAr
 
 **Files:**
 - Create: `knowledge_runtime/v2/embedding.py`
+- Create: `knowledge_runtime/v2/chunking.py`
 - Create: `knowledge_runtime/v2/index.py`
 - Create: `tests/v2/test_embedding.py`
+- Create: `tests/v2/test_chunking.py`
 - Create: `tests/v2/test_index.py`
 - Modify: `pyproject.toml` runtime dependencies for `opensearch-py`.
 
 **Interfaces:**
 - Produces `EmbeddingGateway.embed_batch(texts) -> list[list[float]]` and `DashScopeEmbeddingGateway` using only `DASHSCOPE_API_KEY` and `qwen3.7-text-embedding`.
+- Produces `ChunkSetBuilder` and immutable `Chunk` values. A ChunkSet is a versioned derived view and retains source `element_id`s, section path, page/bbox, and neighbor/parent relations.
 - Produces `IndexBackend.publish_revision`, `remove_revision`, `search_evidence`, `search_assets`, and `rebuild` exactly as defined in the v2 spec.
 - Produces `InMemoryIndexBackend` for contract tests and `OpenSearchIndexBackend` for deployment.
 
@@ -334,11 +355,17 @@ def test_search_returns_only_published_revision(index_backend, revision_input):
     page = index_backend.search_evidence(EvidenceSearchRequest("reserve"))
     assert page.items
     assert all(item.ref.revision_id == revision_input.revision_id for item in page.items)
+
+def test_chunkset_preserves_element_provenance(sample_ir):
+    chunks = ChunkSetBuilder(version="hybrid-v1").build(sample_ir)
+    assert chunks[0].element_ids
+    assert chunks[0].revision_id == sample_ir.revision_id
+    assert chunks[0].section_path == sample_ir.elements[0].section_path
 ```
 
 - [ ] **Step 2: Run the tests and confirm missing implementations**
 
-Run: `python -m pytest tests/v2/test_embedding.py tests/v2/test_index.py -q`
+Run: `python -m pytest tests/v2/test_embedding.py tests/v2/test_chunking.py tests/v2/test_index.py -q`
 
 Expected: failures for the gateway and backend contracts.
 
@@ -346,9 +373,11 @@ Expected: failures for the gateway and backend contracts.
 
 Use an OpenAI-compatible `/embeddings` request. The request body always contains `model="qwen3.7-text-embedding"`; cache keys are `(content_hash, model, dimensions, endpoint)`. If remote embedding is disabled or the key is absent, return an explicit unavailable state instead of reading the Agent key or silently changing models.
 
+Implement `ChunkSetBuilder` beside the gateway. Prefer Docling HybridChunker when the parser supplies a Docling document; otherwise use a deterministic Element-boundary chunker with a maximum token/byte budget. Never discard the Element refs: each derived Chunk stores its source Elements and supports parent/neighbor expansion before the final Evidence read.
+
 - [ ] **Step 4: Implement OpenSearch mappings and bounded hybrid search**
 
-Create one versioned index per schema/encoder configuration. Store Element text, headings, provenance, document/revision/status filters, and vectors when available. Search performs bounded lexical and vector candidate retrieval, weighted RRF, deterministic tie-breaking, and returns only `EvidenceRef`; `get_evidence` later reads the canonical store. `rebuild` enumerates published revisions from CanonicalStore and never materializes the full corpus in Python.
+Create one versioned index per schema/encoder/chunk-set configuration. Store Chunk text, source Element refs, headings, provenance, document/revision/status filters, and vectors when available. Search performs bounded lexical and vector candidate retrieval, weighted RRF, deterministic tie-breaking, and returns only `EvidenceRef`; `get_evidence` later reads the canonical store. Parent/neighbor expansion is bounded and returns the selected Element/range, never an opaque copied passage. `rebuild` enumerates published revisions from CanonicalStore and never materializes the full corpus in Python.
 
 ```python
 def search_evidence(self, request: EvidenceSearchRequest) -> EvidenceSearchPage:
@@ -360,7 +389,7 @@ def search_evidence(self, request: EvidenceSearchRequest) -> EvidenceSearchPage:
 
 - [ ] **Step 5: Run tests and commit**
 
-Run: `python -m pytest tests/v2/test_embedding.py tests/v2/test_index.py -q`
+Run: `python -m pytest tests/v2/test_embedding.py tests/v2/test_chunking.py tests/v2/test_index.py -q`
 
 Expected: all gateway and fake-index tests pass. Commit `feat: add rebuildable hybrid index backend`.
 
@@ -420,6 +449,7 @@ def ingest(self, source: Path, *, document_id: str | None = None, provider: str 
     self.canonical.put_revision(ir, source_hash=raw_hash)
     published = self.index.publish_revision(RevisionIndexInput.from_ir(ir))
     self.canonical.record_index_run(published.index_version, state="SUCCEEDED")
+    self.canonical.begin_publication(ir.document_id, ir.revision_id, index_version=published.index_version)
     self.canonical.publish_current(ir.document_id, ir.revision_id, index_version=published.index_version)
     return IngestionResult(ir.document_id, ir.revision_id, "CURRENT_REVISION_PUBLISHED", reused=False)
 ```
@@ -518,8 +548,8 @@ def test_get_evidence_reads_canonical_content_after_search(runtime, question):
 
 def test_budget_deduplicates_same_evidence(runtime, evidence_ref):
     budget = RetrievalBudget(max_evidence=1, max_bytes=100)
-    assert budget.accept(evidence_ref, "same content")
-    assert not budget.accept(evidence_ref, "same content")
+    assert budget.accept("ev-1", "hash-1", 20)
+    assert not budget.accept("ev-1", "hash-1", 20)
 ```
 
 - [ ] **Step 2: Run tests and verify missing Context Runtime**
@@ -569,14 +599,18 @@ Expected: primitive, provenance, stale revision, and budget tests pass. Commit `
 
 **Files:**
 - Create: `knowledge_runtime/v2/agent.py`
+- Create: `knowledge_runtime/v2/query_planner.py`
 - Create: `knowledge_runtime/v2/compat.py`
 - Create: `tests/v2/test_agent.py`
+- Create: `tests/v2/test_query_planner.py`
 - Create: `tests/v2/test_compat.py`
 - Modify: `knowledge_runtime/llm_client.py` to expose a strict v2 client without changing legacy fallback behavior.
 
 **Interfaces:**
 - Produces `QwenAgentClient` using only `QWEN_LLM_API_KEY`, `QWEN_LLM_BASE_URL`, and `qwen3.8-max`.
-- Produces `AgentRetrievalLoop.run(question, runtime, *, budgets) -> AgentResultV2`, `AgentResultV2`, and `CitationValidationError`.
+- Produces `ConversationState`, `QueryPlan`, `QueryPlanner`, and `AgentRetrievalLoop.run(question, runtime, *, conversation=None, session_id=None, budgets) -> AgentResultV2`.
+- `QueryPlanner` preserves prior-turn anchors, detects pronoun-only ambiguity, records at most the configured query rewrites, and returns a clarification result when no stable retrieval anchor exists.
+- Produces `AgentResultV2` and `CitationValidationError`; citation validation checks every factual claim locally rather than merely appending one citation at the end of an answer.
 - Produces `LegacyProviderAdapter` mapping `list -> search_assets`, `find -> search_assets`, `search -> search_evidence`, `read -> get_evidence`, and `stat -> revision/index status`.
 
 - [ ] **Step 1: Write failing Agent and adapter tests**
@@ -592,6 +626,24 @@ def test_agent_sends_only_read_evidence_to_answer_turn(scripted_model, runtime):
     assert all(item.evidence_id in result.answer for item in result.evidence)
     assert scripted_model.answer_messages_contain_only_evidence()
 
+def test_private_mode_agent_requires_explicit_remote_flag(monkeypatch):
+    config = RuntimeConfig.test_private()
+    monkeypatch.setenv("QWEN_LLM_API_KEY", "agent-secret")
+    with pytest.raises(KRProviderUnavailable, match="remote Agent"):
+        QwenAgentClient(config=config)
+
+def test_agent_preserves_conversation_anchor_for_follow_up(scripted_model, runtime):
+    conversation = ConversationState.from_turns(
+        [{"role": "user", "content": "ASOP 56 的适用范围是什么？"},
+         {"role": "assistant", "content": "已找到 ASOP 56。"}]
+    )
+    result = AgentRetrievalLoop(scripted_model).run("那它的报告要求呢？", runtime, conversation=conversation)
+    assert result.query_plan.rewrites
+
+def test_citation_validator_rejects_uncited_claims(answer_validator, evidence):
+    with pytest.raises(CitationValidationError):
+        answer_validator.validate("范围是全国市场。[ev-1] 还要求季度复核。", (evidence,))
+
 def test_legacy_read_rejects_currently_stale_locator(runtime, legacy_locator):
     adapter = LegacyProviderAdapter(runtime)
     with pytest.raises(KRStaleLocator):
@@ -600,17 +652,17 @@ def test_legacy_read_rejects_currently_stale_locator(runtime, legacy_locator):
 
 - [ ] **Step 2: Run tests and confirm missing Agent/adapter code**
 
-Run: `python -m pytest tests/v2/test_agent.py tests/v2/test_compat.py -q`
+Run: `python -m pytest tests/v2/test_agent.py tests/v2/test_query_planner.py tests/v2/test_compat.py -q`
 
 Expected: failures for the strict gateway, tool loop, and adapter.
 
 - [ ] **Step 3: Implement strict Qwen gateway and five tool definitions**
 
-Use the existing OpenAI-compatible transport shape but reject any model other than `qwen3.8-max` in v2. Tool results send hit metadata first; only selected `Evidence.as_model_input()` payloads enter the answer context. Text/table/image Evidence use compatible content parts without converting away provenance.
+Use the existing OpenAI-compatible transport shape but reject any model other than `qwen3.8-max` in v2. Refuse to construct a remote client in private mode unless `KR_ALLOW_REMOTE_AGENT=true`. Expose exactly `search_evidence`, `search_assets`, `lookup_entity`, `get_claims`, and `get_evidence`; the Agent does not call the database or index directly. Tool results send hit metadata first; only selected `Evidence.as_model_input()` payloads enter the answer context. Text/table/image Evidence use compatible content parts without converting away provenance.
 
-- [ ] **Step 4: Implement stop conditions and citation validation**
+- [ ] **Step 4: Implement conversation-aware planning, stop conditions, and citation validation**
 
-Stop after an answer with Evidence, after no-improvement, or at the configured maximum rounds/bytes. Reject or repair answers whose factual claims lack a nearby Evidence ID. Ambiguous short queries return a clarification result; the loop never broad-searches an unanchored pronoun.
+Build a `ConversationState` from prior user/assistant turns, normalize the current question with `QueryPlanner`, and preserve document names, standards, entities, and unresolved subquestions across turns. Stop after an answer with Evidence, after no-improvement, or at the configured maximum rounds/bytes. Reject answers whose factual claims lack a nearby Evidence ID; do not silently append a generic citation to an unsupported answer. Ambiguous short queries return a clarification result; the loop never broad-searches an unanchored pronoun.
 
 ```python
 for round_no in range(1, budget.max_rounds + 1):
@@ -635,6 +687,7 @@ Preserve legacy Locator JSON, current-revision and stale-revision errors, pagina
 **Files:**
 - Create: `knowledge_runtime/v2/cli.py`
 - Create: `deploy/kr-v2.compose.yml`
+- Create: `deploy/Dockerfile`
 - Create: `deploy/kr-v2.env.example`
 - Create: `deploy/README.md`
 - Create: `scripts/kr-v2.ps1`
@@ -642,21 +695,22 @@ Preserve legacy Locator JSON, current-revision and stale-revision errors, pagina
 - Modify: `knowledge_runtime/cli.py` to dispatch a `v2` command while preserving all existing commands.
 
 **Interfaces:**
-- CLI commands: `kr v2 ingest`, `kr v2 search`, `kr v2 evidence`, `kr v2 ask`, `kr v2 status`, and `kr v2 rebuild-index`.
+- CLI commands: `kr v2 schema-migrate`, `kr v2 ingest`, `kr v2 search`, `kr v2 evidence`, `kr v2 ask`, `kr v2 status`, and `kr v2 rebuild-index`.
 - Compose profiles: `core` (PostgreSQL, MinIO, OpenSearch, API, workers), `semantic` (Neo4j), and `governance` (OpenMetadata and explicitly declared dependencies).
 - Every resource and named volume/network is prefixed with `kr-v2-`; all scripts use `docker compose -p kr-v2 -f deploy/kr-v2.compose.yml`.
 
 - [ ] **Step 1: Write failing CLI and static-scope tests**
 
 ```python
-def test_v2_cli_exposes_five_primitives(capsys):
+def test_v2_cli_exposes_v2_operations(capsys):
     assert "v2" in build_parser().format_help()
-    assert set(v2_command_names()) == {"ingest", "search", "evidence", "ask", "status", "rebuild-index"}
+    assert set(v2_command_names()) == {"schema-migrate", "ingest", "search", "evidence", "ask", "status", "rebuild-index"}
 
 def test_compose_contains_only_kr_v2_owned_names():
     document = yaml.safe_load(Path("deploy/kr-v2.compose.yml").read_text())
     assert document["networks"]["kr-v2-net"]["name"] == "kr-v2-net"
     assert all(name.startswith("kr-v2-") for name in document["volumes"])
+    assert all(service["container_name"].startswith("kr-v2-") for service in document["services"].values())
 ```
 
 - [ ] **Step 2: Run tests to verify the new CLI/deployment surface is absent**
@@ -672,7 +726,7 @@ The CLI constructs `RuntimeConfig`, stores, providers, index, Context Runtime, a
 ```python
 v2 = commands.add_parser("v2", help="Knowledge Runtime v2")
 v2_sub = v2.add_subparsers(dest="v2_command", required=True)
-for name in ("ingest", "search", "evidence", "ask", "status", "rebuild-index"):
+for name in ("schema-migrate", "ingest", "search", "evidence", "ask", "status", "rebuild-index"):
     v2_sub.add_parser(name)
 
 if args.command == "v2":
@@ -681,7 +735,7 @@ if args.command == "v2":
 
 - [ ] **Step 4: Implement the scoped Compose project and PowerShell wrapper**
 
-Use health checks, named volumes, configurable host ports, and a preflight port check. The wrapper exposes only `up`, `down`, `logs`, `inventory`, `backup`, and `restore`; `down` runs only the exact `kr-v2` Compose project. Do not include `docker system prune`, global process termination, or unscoped network/volume removal. Local private mode disables external parser/embedding calls unless explicitly enabled in `.env`.
+Use health checks, named volumes, configurable host ports, and a preflight port check. The wrapper exposes only `up`, `down`, `logs`, `inventory`, `backup`, and `restore`; `down` runs only the exact `kr-v2` Compose project. Do not include `docker system prune`, global process termination, or unscoped network/volume removal. Local private mode disables external parser, embedding, and Agent calls unless explicitly enabled in `.env`.
 
 ```powershell
 $Compose = @("compose", "-p", "kr-v2", "-f", "deploy/kr-v2.compose.yml")
@@ -709,11 +763,13 @@ Expected: Compose renders successfully and the test sees only KR-prefixed resour
 - Create: `benchmarks/v2/cases/scale-v2.jsonl`
 - Create: `tests/v2/test_migration.py`
 - Create: `tests/v2/test_benchmark_metrics.py`
+- Modify: `benchmarks/scale/run_scale_benchmark.py` to accept v2 IndexBackend and report incremental versus initial ingestion.
 - Modify: `benchmarks/actuarial/README.md` and `README.md` with v2 commands and metric definitions.
 
 **Interfaces:**
-- Produces `replay_legacy_sqlite(path, canonical, artifacts, index) -> MigrationReport`, `MigrationReport`, and `score_case(source_rank, evidence_rank, cited_claims, total_claims) -> BenchmarkRow`.
+- Produces `replay_legacy_sqlite(path, canonical, artifacts, index) -> MigrationReport`, `MigrationReport(revisions_copied, raw_artifact_missing)`, and `score_case(source_rank, evidence_rank, cited_claims, total_claims) -> BenchmarkRow`.
 - Benchmark reports include `source_hit_at_k`, `evidence_hit_at_k`, `evidence_coverage`, `claim_local_citation_coverage`, `agent_loop_count`, `ingestion_seconds`, `search_p50_ms`, `search_p95_ms`, `index_build_seconds`, and `evidence_bytes`.
+- Benchmark reports also include `query_rewrite_count`, `clarification_rate`, `retrieval_success_after_rewrite`, `no_improvement_stop_rate`, and `egress_events`.
 - Uses the existing public actuarial fixtures plus explicit cases for fuzzy, short, ambiguous, repeated-follow-up, stale-revision, reindex, and provider parity behavior.
 
 - [ ] **Step 1: Write failing migration and metric tests**
@@ -739,7 +795,7 @@ Expected: failures for the replay function and metric scorer.
 
 - [ ] **Step 3: Implement SQLite replay and v2 benchmark runner**
 
-Read every retained legacy revision, convert old chunks to paragraph `DocumentElement`s with line provenance, copy raw/Markdown/derived artifacts, and re-embed only the new index version. Benchmark every answerable case through search/read and, when the Agent key is present, through the real qwen3.8-max loop. Never use an oracle read to claim Agent success.
+Read every retained legacy revision, convert old chunks to paragraph `DocumentElement`s with line provenance, copy raw/Markdown/derived artifacts, and re-embed only the new index version. If a legacy source path no longer exists, preserve the parsed Markdown and record `raw_artifact_missing` in `MigrationReport` instead of silently claiming a complete raw-file migration. Benchmark every answerable case through search/read and, when the Agent key is present, through the real qwen3.8-max loop. Never use an oracle read to claim Agent success.
 
 ```python
 def replay_legacy_sqlite(path: Path, canonical: CanonicalStore, artifacts: ArtifactStore, index: IndexBackend) -> MigrationReport:
@@ -750,7 +806,11 @@ def replay_legacy_sqlite(path: Path, canonical: CanonicalStore, artifacts: Artif
             ir = legacy_revision_to_document_ir(legacy.get_revision(asset.asset_id, revision["revision_id"]))
             canonical.put_revision(ir, source_hash=revision["source_hash"])
             artifacts.put_bytes(document_id=ir.document_id, revision_id=ir.revision_id, name="full.md", data=ir_to_markdown(ir).encode(), media_type="text/markdown")
-            index.publish_revision(RevisionIndexInput.from_ir(ir))
+            published = index.publish_revision(RevisionIndexInput.from_ir(ir))
+            canonical.record_index_run(published.index_version, state="SUCCEEDED")
+            canonical.begin_publication(ir.document_id, ir.revision_id, index_version=published.index_version)
+            if revision["revision_id"] == legacy.get(asset.asset_id).revision_id:
+                canonical.publish_current(ir.document_id, ir.revision_id, index_version=published.index_version)
             copied += 1
     return MigrationReport(revisions_copied=copied)
 ```
@@ -776,6 +836,17 @@ Run: `python -m pytest -q` and `python benchmarks/v2/run_benchmark.py --cases be
 
 Expected: all existing tests remain green and the v2 source/Evidence baseline is no worse than the recorded pre-migration baseline unless the report includes a measured, explained trade-off. The benchmark report contains separate source, Evidence, citation, latency, and loop metrics. Commit `test: add v2 migration and benchmark gates`.
 
+### Acceptance targets for the POC
+
+These are measurable gates for the first usable v2 release, not production SLOs:
+
+- Deterministic gold questions: source Hit@3 and Evidence Hit@3 must be at least the current recorded baseline in `docs/reports/2026-09-14-hybrid-retrieval-results.md`; Evidence coverage must be at least 0.80.
+- Answerable Agent questions: every successful answer must include at least one resolved Evidence ref; claim-local citation coverage target is at least 0.90, with failures reported by claim rather than hidden by appended citations.
+- Fuzzy/short questions: the report must distinguish successful retrieval, a justified clarification request, and budget exhaustion; an ambiguous prompt must not be counted as a retrieval failure when clarification is correct.
+- Revision/reindex/failure tests: no failed or stale revision may become current, and rebuilding the index from CanonicalStore must reproduce the Evidence refs.
+- Scale tests: the OpenSearch path must not materialize the full corpus vector set in Python; incremental ingestion must process only changed revisions and report p50/p95 separately from model latency.
+- Private mode: `egress_events` must remain zero unless the caller explicitly enables a remote parser, embedding gateway, or Agent gateway; logs and benchmark artifacts must contain no key or document body.
+
 ### Task 11: Execute migration review and final verification
 
 **Files:**
@@ -798,7 +869,7 @@ Run: `docker compose -p kr-v2 -f deploy/kr-v2.compose.yml --profile core config`
 
 - [ ] **Step 3: Run the actuarial and edge-case benchmark with configured services**
 
-Run the offline benchmark first. If the user explicitly enables external embedding/Agent calls, rerun with `DASHSCOPE_API_KEY` and `QWEN_LLM_API_KEY` loaded from the environment and redact request bodies from artifacts.
+Run the offline benchmark first. For the authorized cloud Qwen POC run, explicitly set `KR_ALLOW_REMOTE_AGENT=true` (and, when needed, `KR_ALLOW_REMOTE_EMBEDDING=true`), load `DASHSCOPE_API_KEY` and `QWEN_LLM_API_KEY` only from the environment, and redact request bodies from artifacts.
 
 - [ ] **Step 4: Review the final report against the spec**
 

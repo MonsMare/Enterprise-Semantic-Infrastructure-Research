@@ -36,11 +36,13 @@ PostgreSQL-compatible storage is the canonical metadata and Element store. An S3
 - PostgreSQL-compatible CanonicalStore with JSONB metadata and transactional revision publication.
 - S3-compatible ArtifactStore; MinIO is the local private deployment default.
 - Docling as the primary local Document IR parser; Unstructured high-resolution/VLM as fallback; MinerU remains an adapter option.
+- A provider-neutral local model gateway may be injected into the local parser/enrichment path. The POC may use the configured cloud Qwen gateway explicitly; the long-term private deployment can replace it with a local OpenAI-compatible endpoint without changing Provider or Evidence contracts.
 - OpenSearch for lexical, vector, hybrid, filtering, and ranking indexes.
 - Neo4j for the fixed Semantic Overlay graph meta-schema.
 - OpenMetadata for domains, glossary terms, classifications, ownership, certification, and lineage.
 - `DASHSCOPE_API_KEY` exclusively for `qwen3.7-text-embedding` when a remote embedding service is enabled.
 - `QWEN_LLM_API_KEY` exclusively for the Agent model `qwen3.8-max`.
+- Remote Agent, parser, and embedding calls are disabled by default in private mode and require explicit configuration flags. The POC may explicitly enable the cloud Agent gateway for the supplied Qwen resource.
 - Docker Compose profiles with a `kr-v2` project name for local services. Docker operations are restricted to KR-prefixed containers, networks, volumes, and ports.
 
 ## Global Invariants
@@ -97,6 +99,8 @@ class DocumentElement:
 ```
 
 Table structure, merged cells, image references, formulas, and reading order remain in `payload` and `provenance`; they are not flattened into plain text during canonical storage.
+
+ChunkSets are derived after canonical persistence. A ChunkSet records its version, source Element IDs, section/page provenance, and bounded parent/neighbor relations. It can use Docling HybridChunker when available and a deterministic Element-boundary fallback otherwise; deleting or rebuilding a ChunkSet never changes `DocumentIR`.
 
 ### ParserRouter and QualityGate
 
@@ -298,6 +302,8 @@ The Context Runtime may route a request across OpenSearch, OpenMetadata, and Neo
 
 The Agent client reads `QWEN_LLM_API_KEY` and calls `qwen3.8-max`. It does not read `DASHSCOPE_API_KEY`, use the embedding model for chat, or silently fall back between keys. Text, table, image, and other media Evidence are passed using the model's compatible content parts when the selected representation requires them. Tool messages contain SearchHit metadata first; only selected `Evidence.as_model_input()` payloads are appended as answer evidence. The answer validator checks citation locality and unsupported claims before returning success.
 
+The Agent gateway exposes exactly the five Context Runtime primitives. A `ConversationState` and `QueryPlanner` preserve document, entity, standard, and unresolved-subquestion anchors across turns, cap query rewrites, and return clarification when a short follow-up has no stable anchor. In private mode the gateway refuses to construct a remote client unless its explicit Agent egress flag is enabled.
+
 ## Compatibility Adapter
 
 The current public surface remains available during migration:
@@ -392,5 +398,12 @@ The deployment includes health checks, named persistent volumes, backup/restore 
 - Reindexing, revision switching, deletion, and failed parser/index jobs must preserve the canonical source and Evidence contract.
 - Docker integration tests must inspect and manipulate only `kr-v2-*` resources.
 - Private mode tests must fail closed when an external model/parser endpoint is configured without explicit opt-in; logs and test output must not contain API keys or document bodies.
+
+### POC acceptance targets
+
+- Deterministic gold questions meet or exceed the current recorded source/Evidence Hit@3 baseline, with Evidence coverage at least 0.80.
+- Every successful Agent answer resolves at least one Evidence ref, and claim-local citation coverage targets at least 0.90.
+- Fuzzy and ambiguous prompts distinguish successful retrieval, justified clarification, and budget exhaustion; they are not collapsed into one accuracy number.
+- Rebuilds reproduce Evidence refs, failed revisions never become current, and private-mode egress remains zero until explicitly enabled.
 
 The v2 implementation is complete only when the canonical store can rebuild every index, every sourced answer can resolve its Evidence, and the Agent can use the five primitives without depending on a mutable, LLM-generated top-level Ontology.
