@@ -60,7 +60,13 @@ def _load_cases(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def run_cases(path: Path, *, offline: bool = True, corpus: Path | None = None) -> dict[str, Any]:
+def run_cases(
+    path: Path,
+    *,
+    offline: bool = True,
+    corpus: Path | None = None,
+    live_agent: bool = False,
+) -> dict[str, Any]:
     cases = _load_cases(path)
     measured = corpus is not None
     measured_rows: dict[str, tuple[int | None, int | None, float]] = {}
@@ -68,6 +74,7 @@ def run_cases(path: Path, *, offline: bool = True, corpus: Path | None = None) -
     index_build_seconds = 0.0
     if corpus is not None:
         measured_rows, ingestion_seconds, index_build_seconds = _measure_retrieval(corpus, cases)
+    live_metrics = _run_live_agent(corpus, cases) if live_agent else {}
     rows: list[BenchmarkRow] = []
     for case in cases:
         source_rank = case.get("source_rank")
@@ -96,21 +103,22 @@ def run_cases(path: Path, *, offline: bool = True, corpus: Path | None = None) -
         "measured": measured,
         "corpus": str(corpus) if corpus is not None else None,
         "offline": offline,
+        "agent_live": live_agent,
         "source_hit_at_k": {str(k): mean_dict(rows, "source_hit_at_k", k) for k in (1, 3, 5, 10)},
         "evidence_hit_at_k": {str(k): mean_dict(rows, "evidence_hit_at_k", k) for k in (1, 3, 5, 10)},
         "evidence_coverage": mean("evidence_coverage"),
         "claim_local_citation_coverage": mean("claim_local_citation_coverage"),
-        "agent_loop_count": 0,
+        "agent_loop_count": live_metrics.get("agent_loop_count", 0),
         "ingestion_seconds": ingestion_seconds,
         "search_p50_ms": 0.0,
         "search_p95_ms": 0.0,
         "index_build_seconds": index_build_seconds,
-        "evidence_bytes": 0,
-        "query_rewrite_count": 0,
-        "clarification_rate": 0.0,
-        "retrieval_success_after_rewrite": 0.0,
-        "no_improvement_stop_rate": 0.0,
-        "egress_events": 0,
+        "evidence_bytes": live_metrics.get("evidence_bytes", 0),
+        "query_rewrite_count": live_metrics.get("query_rewrite_count", 0),
+        "clarification_rate": live_metrics.get("clarification_rate", 0.0),
+        "retrieval_success_after_rewrite": live_metrics.get("retrieval_success_after_rewrite", 0.0),
+        "no_improvement_stop_rate": live_metrics.get("no_improvement_stop_rate", 0.0),
+        "egress_events": live_metrics.get("egress_events", 0),
     }
 
 
@@ -166,6 +174,61 @@ def _measure_retrieval(corpus: Path, cases: list[dict[str, Any]]) -> tuple[dict[
     return measured, ingestion_seconds, 0.0
 
 
+def _run_live_agent(corpus: Path | None, cases: list[dict[str, Any]]) -> dict[str, Any]:
+    if corpus is None:
+        raise ValueError("--live-agent requires --corpus")
+    from knowledge_runtime.v2.agent import AgentRetrievalLoop, QwenAgentClient
+    from knowledge_runtime.v2.artifacts import FilesystemArtifactStore
+    from knowledge_runtime.v2.canonical import InMemoryCanonicalStore
+    from knowledge_runtime.v2.config import RuntimeConfig
+    from knowledge_runtime.v2.context import ContextRuntime
+    from knowledge_runtime.v2.index import InMemoryIndexBackend
+    from knowledge_runtime.v2.ingestion import IngestionService
+    from knowledge_runtime.v2.providers import LocalProvider, ParserRouter
+
+    config = RuntimeConfig.from_env()
+    config.require_remote_agent()
+    canonical = InMemoryCanonicalStore()
+    index = InMemoryIndexBackend(canonical=canonical)
+    service = IngestionService(
+        router=ParserRouter(config=config, local=LocalProvider(config)),
+        quality=None,
+        canonical=canonical,
+        artifacts=FilesystemArtifactStore(Path(tempfile.mkdtemp(prefix="kr-v2-agent-benchmark-"))),
+        index=index,
+    )
+    for path in sorted(
+        path
+        for path in corpus.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".md", ".markdown", ".txt", ".rst", ".csv", ".json", ".xml"}
+    ):
+        service.ingest(path, provider="local")
+    loop = AgentRetrievalLoop(QwenAgentClient(config=config))
+    runtime = ContextRuntime(canonical=canonical, index=index)
+    rounds = rewrites = clarifications = successes = evidence_bytes = no_improvement = 0
+    for case in cases:
+        result = loop.run(str(case.get("question", "")), runtime)
+        rounds += result.iterations
+        rewrite_count = len(result.query_plan.rewrites) if result.query_plan else 0
+        rewrites += rewrite_count
+        clarifications += int(result.stopped_reason == "clarification_needed")
+        successes += int(bool(result.evidence) and rewrite_count > 0)
+        no_improvement += int(result.stopped_reason == "max_rounds")
+        evidence_bytes += sum(len(str(item.content).encode("utf-8")) for item in result.evidence)
+    count = max(1, len(cases))
+    return {
+        "agent_loop_count": rounds,
+        "query_rewrite_count": rewrites,
+        "clarification_rate": clarifications / count,
+        "retrieval_success_after_rewrite": successes / count,
+        "no_improvement_stop_rate": no_improvement / count,
+        "evidence_bytes": evidence_bytes,
+        # Every model round is an explicit egress event in this mode; request
+        # bodies remain out of the benchmark artifact.
+        "egress_events": rounds,
+    }
+
+
 def mean_dict(rows: list[BenchmarkRow], name: str, key: int) -> float:
     values = [getattr(row, name).get(key, 0.0) for row in rows]
     return sum(values) / len(values) if values else 0.0
@@ -176,9 +239,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cases", type=Path, required=True)
     parser.add_argument("--corpus", type=Path)
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--live-agent", action="store_true", help="run real qwen3.8-max; requires explicit remote Agent enablement")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
-    report = run_cases(args.cases, offline=args.offline, corpus=args.corpus)
+    report = run_cases(args.cases, offline=args.offline, corpus=args.corpus, live_agent=args.live_agent)
     serialized = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -189,4 +253,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -44,6 +44,13 @@ Hit@k、Evidence Hit@k、Evidence coverage、claim-local citation coverage、Age
 python -m benchmarks.v2.run_benchmark --cases .\benchmarks\v2\cases\actuarial-v2.jsonl --corpus .kr-data\actuarial-downloads --offline --output .kr-data\v2-actuarial.json
 ```
 
+在已明确批准云端 Agent 出域、并设置 `KR_ALLOW_REMOTE_AGENT=true` 后，追加
+`--live-agent` 才会真实调用 qwen3.8-max；请求正文不会写入 benchmark 产物：
+
+```powershell
+python -m benchmarks.v2.run_benchmark --cases .\benchmarks\v2\cases\fuzzy-v2.jsonl --corpus .kr-data\actuarial-downloads --live-agent --output .kr-data\v2-fuzzy-agent.json
+```
+
 旧的 `list/find/search/read/stat` 接口继续可用，并通过 `LegacyProviderAdapter`
 映射到 v2 的 asset/evidence primitives。旧 SQLite 资产可以用
 `knowledge_runtime.v2.migration.replay_legacy_sqlite` 重放到新的规范存储和索引。

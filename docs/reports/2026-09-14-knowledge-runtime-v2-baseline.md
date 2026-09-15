@@ -43,6 +43,10 @@ python -m benchmarks.v2.run_benchmark `
   --output .kr-data\v2-actuarial.json
 ```
 
+若需要真实 Agent 交互，明确设置 `KR_ALLOW_REMOTE_AGENT=true` 后将 `--offline`
+替换为 `--live-agent`；该模式记录 Agent 轮数、改写次数、澄清率、Evidence 字节数和
+egress 次数，但不会把请求正文或回答正文写入报告。
+
 不提供 `--corpus` 时脚本会明确写出 `measured=false`，不会把缺少本地公开文档误报成
 检索成功；提供下载后的精算语料后，脚本才计算 source Hit@k、Evidence phrase
 coverage 和 Evidence Hit@k。当前仓库没有把第三方 PDF 放入 Git，因此本次代码验证不
