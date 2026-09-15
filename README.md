@@ -1,5 +1,53 @@
 # Knowledge Runtime POC
 
+## v2 Knowledge Runtime 基线
+
+当前 v2 以 `DocumentIR` 作为解析后的规范事实，以不可变 `EvidenceRef/Evidence`
+作为 Agent 可消费的证据契约。原始文件和 MinerU/Docling 产物进入 S3-compatible
+ArtifactStore；文档 revision、元素、解析质量、发布状态和运行遥测进入
+PostgreSQL-compatible CanonicalStore；OpenSearch 或其他 `IndexBackend` 只保存可重建
+的派生检索数据。检索只返回引用，回答前必须通过 `get_evidence` 回到规范存储读取内容。
+
+v2 的最小离线闭环可以直接运行：
+
+```powershell
+python -m pip install -e ".[dev,runtime]"
+python -m knowledge_runtime.cli v2 ingest .\docs\runbook.md --provider local
+python -m knowledge_runtime.cli v2 search "reserve margin"
+python -m knowledge_runtime.cli v2 status
+```
+
+启用真实 Qwen Agent 前，需要显式设置 `KR_ALLOW_REMOTE_AGENT=true`、
+`QWEN_LLM_API_KEY` 和 `QWEN_LLM_BASE_URL`；Agent 固定使用 `qwen3.8-max`。
+启用云端 embedding 还需要 `KR_ALLOW_REMOTE_EMBEDDING=true`、
+`DASHSCOPE_API_KEY` 和 `DASHSCOPE_BASE_URL`，固定使用
+`qwen3.7-text-embedding`。私有模式默认关闭所有远程解析、embedding 和 Agent 请求。
+
+私有部署使用隔离的 Compose 项目：
+
+```powershell
+Copy-Item .\deploy\kr-v2.env.example .\.env
+.\scripts\kr-v2.ps1 up -Profile core
+.\scripts\kr-v2.ps1 inventory
+.\scripts\kr-v2.ps1 down
+```
+
+脚本只操作 `kr-v2` Compose 项目；PostgreSQL、MinIO、OpenSearch、API 和 worker
+的名称、网络和卷均使用 `kr-v2-` 前缀。语义 overlay（Neo4j）和治理 profile
+是可选组件，故障不会阻塞 L1 入库、Evidence 读取或五个 Context Runtime 原语。
+
+v2 的离线精算、模糊问题和规模数据集位于 `benchmarks/v2/cases/`。指标把 source
+Hit@k、Evidence Hit@k、Evidence coverage、claim-local citation coverage、Agent
+轮数、查询改写、澄清率、延迟和 egress 事件分开记录：
+
+```powershell
+python -m benchmarks.v2.run_benchmark --cases .\benchmarks\v2\cases\actuarial-v2.jsonl --corpus .kr-data\actuarial-downloads --offline --output .kr-data\v2-actuarial.json
+```
+
+旧的 `list/find/search/read/stat` 接口继续可用，并通过 `LegacyProviderAdapter`
+映射到 v2 的 asset/evidence primitives。旧 SQLite 资产可以用
+`knowledge_runtime.v2.migration.replay_legacy_sqlite` 重放到新的规范存储和索引。
+
 一个 evidence-first、渐进式读取的 Knowledge Runtime 原型。模型通过 `list/find/search/read/stat` 工具自行导航；Search 只返回 Locator，Read 才生成带来源 revision 与 SHA-256 的 Evidence。MinerU Cloud 和 Local Extraction Backend 产出同一类 Knowledge Asset，后续问答不依赖解析后端。
 
 ## 运行环境

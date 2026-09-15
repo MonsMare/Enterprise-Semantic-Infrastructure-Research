@@ -1,5 +1,10 @@
 # Knowledge Runtime：私有化与现有数据平台接入参考路径
 
+> 实现状态：本文建议的默认路径已经在 v2 POC 中冻结为
+> `CanonicalStore + ArtifactStore + IndexBackend + Evidence Contract`。离线核心
+> 实现位于 `knowledge_runtime/v2/`；可复制的私有 Compose 入口是
+> `deploy/kr-v2.compose.yml`，Windows 操作包装器是 `scripts/kr-v2.ps1`。
+
 ## 决策结论
 
 KR 不应把 Databricks、PolarDB、Supabase 中任何一个产品的对象模型变成自己的核心模型。更稳定的做法是冻结四个小接口：
