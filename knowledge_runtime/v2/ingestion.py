@@ -120,6 +120,8 @@ class IngestionService:
                     RevisionIndexInput.from_ir(ir, chunks=self.chunk_builder.build(ir)),
                     index_version=index_version,
                 )
+                if indexed.state != "SUCCEEDED":
+                    raise RuntimeError(f"index publication returned state {indexed.state}")
             except Exception as exc:
                 self.canonical.record_index_run(index_version, state="FAILED", error=str(exc))
                 remove_revision = getattr(self.index, "remove_revision", None)
