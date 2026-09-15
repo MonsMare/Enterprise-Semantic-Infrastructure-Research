@@ -62,6 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
     catalog = commands.add_parser("catalog", help="inspect persisted knowledge assets and revisions")
     catalog.add_argument("--store", type=Path, default=Path(".kr-data/assets"))
     catalog.add_argument("--asset-id")
+
+    v2 = commands.add_parser("v2", help="Knowledge Runtime v2 (canonical store, Evidence, and Agent tools)")
+    v2_commands = v2.add_subparsers(dest="v2_command", required=True)
+    for name in ("schema-migrate", "ingest", "search", "evidence", "ask", "status", "rebuild-index"):
+        v2_commands.add_parser(name)
     return parser
 
 
@@ -73,6 +78,11 @@ def open_asset_store(path: Path):
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    if raw_argv and raw_argv[0] == "v2":
+        from .v2.cli import main as v2_main
+
+        return v2_main(raw_argv)
     args = build_parser().parse_args(argv)
     store = open_asset_store(args.store)
     try:

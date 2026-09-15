@@ -1,0 +1,121 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: kr-v2-postgres
+    profiles: [core]
+    environment:
+      POSTGRES_DB: ${KR_POSTGRES_DB:-knowledge_runtime}
+      POSTGRES_USER: ${KR_POSTGRES_USER:-kr}
+      POSTGRES_PASSWORD: ${KR_POSTGRES_PASSWORD:-change-me}
+    volumes:
+      - kr-v2-postgres-data:/var/lib/postgresql/data
+    networks: [kr-v2-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    container_name: kr-v2-minio
+    profiles: [core]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${KR_MINIO_ROOT_USER:-kr-minio}
+      MINIO_ROOT_PASSWORD: ${KR_MINIO_ROOT_PASSWORD:-change-me-too}
+    ports:
+      - "${KR_MINIO_PORT:-9000}:9000"
+      - "${KR_MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - kr-v2-minio-data:/data
+    networks: [kr-v2-net]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  opensearch:
+    image: opensearchproject/opensearch:2.15.0
+    container_name: kr-v2-opensearch
+    profiles: [core]
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "${KR_OPENSEARCH_PORT:-9200}:9200"
+    volumes:
+      - kr-v2-opensearch-data:/usr/share/opensearch/data
+    networks: [kr-v2-net]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: kr-v2-api
+    profiles: [core]
+    command: ["python", "-m", "knowledge_runtime.v2.cli", "v2", "status"]
+    environment:
+      KR_PRIVATE_MODE: ${KR_PRIVATE_MODE:-true}
+      KR_DATABASE_URL: ${KR_DATABASE_URL:-postgresql://kr:change-me@postgres:5432/knowledge_runtime}
+      KR_ARTIFACT_ENDPOINT: ${KR_ARTIFACT_ENDPOINT:-http://minio:9000}
+      KR_OPENSEARCH_URL: ${KR_OPENSEARCH_URL:-http://opensearch:9200}
+    depends_on:
+      postgres: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      opensearch: {condition: service_healthy}
+    networks: [kr-v2-net]
+
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: kr-v2-worker
+    profiles: [core]
+    command: ["python", "-m", "knowledge_runtime.v2.cli", "v2", "status"]
+    environment:
+      KR_PRIVATE_MODE: ${KR_PRIVATE_MODE:-true}
+      KR_DATABASE_URL: ${KR_DATABASE_URL:-postgresql://kr:change-me@postgres:5432/knowledge_runtime}
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [kr-v2-net]
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: kr-v2-neo4j
+    profiles: [semantic]
+    environment:
+      NEO4J_AUTH: ${KR_NEO4J_AUTH:-neo4j/change-me}
+    volumes:
+      - kr-v2-neo4j-data:/data
+    networks: [kr-v2-net]
+
+  openmetadata:
+    image: openmetadata/server:1.4.5
+    container_name: kr-v2-openmetadata
+    profiles: [governance]
+    environment:
+      SERVER_HOST_API_URL: ${KR_OPENMETADATA_API_URL:-http://openmetadata:8585/api}
+    networks: [kr-v2-net]
+
+networks:
+  kr-v2-net:
+    name: kr-v2-net
+
+volumes:
+  kr-v2-postgres-data:
+    name: kr-v2-postgres-data
+  kr-v2-minio-data:
+    name: kr-v2-minio-data
+  kr-v2-opensearch-data:
+    name: kr-v2-opensearch-data
+  kr-v2-neo4j-data:
+    name: kr-v2-neo4j-data
+
