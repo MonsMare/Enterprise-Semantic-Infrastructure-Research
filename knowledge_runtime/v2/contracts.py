@@ -482,11 +482,14 @@ class SemanticProposal:
 
     def __post_init__(self) -> None:
         _validate_score("confidence", self.confidence)
-        if not self.evidence_refs and self.kind in {"claim", "entity", "term", "relation"}:
+        if (
+            not self.evidence_refs
+            and self.status in {"AUTO_ACCEPTED", "VERIFIED", "CERTIFIED"}
+            and self.kind in {"claim", "entity", "term", "relation"}
+        ):
             raise ValueError("semantic proposal requires Evidence refs")
 
 
 def object_name(value: str) -> str:
     """Return a safe final object name for artifact adapters."""
     return PurePosixPath(value.replace("\\", "/")).name
-
