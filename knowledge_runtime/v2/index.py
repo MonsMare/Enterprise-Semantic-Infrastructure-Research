@@ -218,10 +218,11 @@ class InMemoryIndexBackend:
 class OpenSearchIndexBackend:
     """Thin OpenSearch adapter; all canonical reads remain outside the index."""
 
-    def __init__(self, *, client: Any, index_name: str = "kr-v2-evidence", embedding: Any | None = None) -> None:
+    def __init__(self, *, client: Any, index_name: str = "kr-v2-evidence", embedding: Any | None = None, canonical: Any | None = None) -> None:
         self.client = client
         self.index_name = index_name
         self.embedding = embedding
+        self.canonical = canonical
 
     def publish_revision(self, revision: RevisionIndexInput, *, index_version: str | None = None) -> IndexPublishResult:
         version = index_version or self.index_name
@@ -288,5 +289,18 @@ class OpenSearchIndexBackend:
         return AssetSearchPage(tuple(groups.values()))
 
     def rebuild(self, request: IndexRebuildRequest) -> IndexBuildReport:
-        return IndexBuildReport(request.index_version, 0, 0, 0, "DEFERRED", {"reason": "enumerate via ingestion worker"})
-
+        if self.canonical is None:
+            return IndexBuildReport(request.index_version, 0, 0, 0, "SKIPPED", {"reason": "canonical store unavailable"})
+        revisions = self.canonical.list_current_documents()
+        if request.document_ids:
+            revisions = [revision for revision in revisions if revision.document_id in request.document_ids]
+        elements = chunks = 0
+        for revision in revisions:
+            ir = self.canonical.get_ir(revision.document_id, revision.revision_id)
+            if not request.dry_run:
+                result = self.publish_revision(RevisionIndexInput.from_ir(ir), index_version=request.index_version)
+                chunks += result.indexed_count
+            else:
+                chunks += len(ir.elements)
+            elements += len(ir.elements)
+        return IndexBuildReport(request.index_version, len(revisions), elements, chunks, "SUCCEEDED")
