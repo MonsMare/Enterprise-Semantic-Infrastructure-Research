@@ -817,7 +817,7 @@ def replay_legacy_sqlite(path: Path, canonical: CanonicalStore, artifacts: Artif
 
 - [ ] **Step 4: Add scale and edge-case gates**
 
-Measure initial versus incremental ingestion, index rebuild, search p50/p95, candidate count, Evidence bytes, and Agent rounds at multiple corpus sizes. Include deliberately vague Chinese and English prompts, pronoun-only follow-ups, missing identifiers, wrong-language terminology, and conflicting revisions. Record whether the Agent asks for clarification, rewrites once or twice, stops after sufficient Evidence, or exhausts its budget.
+Measure initial versus incremental ingestion, index rebuild, search p50/p95, candidate count, Evidence bytes, and Agent rounds at corpus sizes `20,100,1000,5000` documents using the existing deterministic scale generator. Include deliberately vague Chinese and English prompts, pronoun-only follow-ups, missing identifiers, wrong-language terminology, and conflicting revisions. Record whether the Agent asks for clarification, rewrites once or twice, stops after sufficient Evidence, or exhausts its budget.
 
 ```python
 metrics = {
