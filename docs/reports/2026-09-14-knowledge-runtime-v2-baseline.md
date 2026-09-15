@@ -21,7 +21,7 @@ Evidence 的 proposal 才能进入 VERIFIED/CERTIFIED；Neo4j 和 OpenMetadata �
 在隔离分支 `v2-core-implementation` 上执行：
 
 ```text
-python -m pytest -q                         172 passed
+python -m pytest -q                         173 passed
 python -m compileall knowledge_runtime      passed
 git diff --check                             passed
 docker compose -p kr-v2 -f deploy/kr-v2.compose.yml --profile core config  passed
@@ -72,4 +72,3 @@ Agent 只读取 `QWEN_LLM_API_KEY`，embedding 只读取 `DASHSCOPE_API_KEY`，�
    `kr-v2` 环境做一次集成运行，确认 schema migration、备份恢复和索引重建的运维数据。
 4. Docling/Unstructured 的版式、扫描 OCR 和图片 Evidence 需要安装对应 local-parser
    extra 后做真实文件验收；缺少依赖时 v2 会显式拒绝复杂文档，不会静默降级。
-
