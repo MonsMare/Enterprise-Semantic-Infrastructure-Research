@@ -130,8 +130,14 @@ class InMemoryIndexBackend:
         for hit in self._hits.values():
             if document_ids and hit.document_id not in document_ids:
                 continue
-            if getattr(filters, "current_only", True) and self._active.get(hit.document_id) != hit.revision_id:
-                continue
+            if getattr(filters, "current_only", True):
+                current = (
+                    self.canonical.current_revision(hit.document_id)
+                    if self.canonical is not None
+                    else self._active.get(hit.document_id)
+                )
+                if current != hit.revision_id:
+                    continue
             result.append(hit)
         return result
 
@@ -203,15 +209,43 @@ class InMemoryIndexBackend:
         if request.document_ids:
             revisions = [revision for revision in revisions if revision.document_id in request.document_ids]
         elements = chunks = 0
-        for revision in revisions:
-            ir = self.canonical.get_ir(revision.document_id, revision.revision_id)
-            if not request.dry_run:
-                result = self.publish_revision(RevisionIndexInput.from_ir(ir), index_version=request.index_version)
-                elements += len(ir.elements)
-                chunks += result.indexed_count
-            else:
+        if request.dry_run:
+            for revision in revisions:
+                ir = self.canonical.get_ir(revision.document_id, revision.revision_id)
                 elements += len(ir.elements)
                 chunks += len(ir.elements)
+            return IndexBuildReport(request.index_version, len(revisions), elements, chunks, "SUCCEEDED")
+        staged = InMemoryIndexBackend(canonical=self.canonical)
+        staged._hits = dict(self._hits)
+        staged._revisions = dict(self._revisions)
+        staged._active = dict(self._active)
+        requested = set(request.document_ids)
+        if requested:
+            for document_id, revision_id in list(staged._revisions):
+                if document_id in requested:
+                    staged.remove_revision(document_id, revision_id)
+        else:
+            staged._hits.clear()
+            staged._revisions.clear()
+            staged._active.clear()
+        try:
+            for revision in revisions:
+                ir = self.canonical.get_ir(revision.document_id, revision.revision_id)
+                result = staged.publish_revision(RevisionIndexInput.from_ir(ir), index_version=request.index_version)
+                elements += len(ir.elements)
+                chunks += result.indexed_count
+        except Exception as exc:
+            return IndexBuildReport(
+                request.index_version,
+                len(revisions),
+                elements,
+                chunks,
+                "FAILED",
+                {"error": f"{type(exc).__name__}: {str(exc)[:300]}"},
+            )
+        self._hits = staged._hits
+        self._revisions = staged._revisions
+        self._active = staged._active
         return IndexBuildReport(request.index_version, len(revisions), elements, chunks, "SUCCEEDED")
 
 
@@ -254,23 +288,27 @@ class OpenSearchIndexBackend:
 
     def search_evidence(self, request: EvidenceSearchRequest) -> EvidenceSearchPage:
         body: dict[str, Any] = {
-            "size": request.limit,
+            "size": min(200, max(request.limit, request.limit * 5)),
             "query": {"multi_match": {"query": request.query, "fields": ["text^2", "source_name", "section_path"]}},
         }
         response = self.client.search(index=self.index_name, body=body)
         hits = []
-        for rank, row in enumerate(response.get("hits", {}).get("hits", []), start=1):
+        for row in response.get("hits", {}).get("hits", []):
             source = row.get("_source", {})
+            if self.canonical is not None and self.canonical.current_revision(source["document_id"]) != source["revision_id"]:
+                continue
             hits.append(
                 SearchHitV2(
                     ref=EvidenceRef(source["document_id"], source["revision_id"], source["element_id"], {"type": "element"}),
                     display_name=source.get("source_name", source["document_id"]),
                     preview=source.get("text", "")[:240],
                     score=float(row.get("_score", 0.0)),
-                    rank=rank,
+                    rank=len(hits) + 1,
                     metadata=source.get("metadata", {}),
                 )
             )
+            if len(hits) >= request.limit:
+                break
         return EvidenceSearchPage(tuple(hits), diagnostics={"backend": "opensearch"})
 
     def search_assets(self, request: AssetSearchRequest) -> AssetSearchPage:
@@ -281,6 +319,8 @@ class OpenSearchIndexBackend:
         groups: dict[tuple[str, str], AssetSearchHit] = {}
         for row in response.get("hits", {}).get("hits", []):
             source = row.get("_source", {})
+            if self.canonical is not None and self.canonical.current_revision(source["document_id"]) != source["revision_id"]:
+                continue
             key = (source["document_id"], source["revision_id"])
             groups.setdefault(
                 key,
@@ -295,12 +335,22 @@ class OpenSearchIndexBackend:
         if request.document_ids:
             revisions = [revision for revision in revisions if revision.document_id in request.document_ids]
         elements = chunks = 0
-        for revision in revisions:
-            ir = self.canonical.get_ir(revision.document_id, revision.revision_id)
-            if not request.dry_run:
-                result = self.publish_revision(RevisionIndexInput.from_ir(ir), index_version=request.index_version)
-                chunks += result.indexed_count
-            else:
-                chunks += len(ir.elements)
-            elements += len(ir.elements)
+        try:
+            for revision in revisions:
+                ir = self.canonical.get_ir(revision.document_id, revision.revision_id)
+                if not request.dry_run:
+                    result = self.publish_revision(RevisionIndexInput.from_ir(ir), index_version=request.index_version)
+                    chunks += result.indexed_count
+                else:
+                    chunks += len(ir.elements)
+                elements += len(ir.elements)
+        except Exception as exc:
+            return IndexBuildReport(
+                request.index_version,
+                len(revisions),
+                elements,
+                chunks,
+                "FAILED",
+                {"error": f"{type(exc).__name__}: {str(exc)[:300]}"},
+            )
         return IndexBuildReport(request.index_version, len(revisions), elements, chunks, "SUCCEEDED")

@@ -395,10 +395,41 @@ class ParserRouter:
         self.remote = remote
 
     def choose(self, source: Path) -> ParserProvider:
+        return self.parse_candidates(source, document_id="router", revision_id="router")[0]
+
+    def parse_candidates(
+        self,
+        source: Path,
+        *,
+        document_id: str,
+        revision_id: str,
+        provider: str = "auto",
+    ) -> tuple[ParserProvider, ...]:
+        """Return the egress-safe parser order for one immutable revision.
+
+        A local parser is always tried first for automatic routing. Remote
+        MinerU can be a quality fallback only after its explicit runtime gate
+        is open; it is never silently selected merely because it is configured.
+        The identity arguments keep this decision boundary aligned with the
+        parser contract and make callers pass a concrete revision context.
+        """
+
+        del source, document_id, revision_id
+        if provider == "local":
+            return (self.local,)
+        if provider in {"remote", "mineru", "mineru-cloud"}:
+            if self.remote is None:
+                raise RuntimeError("remote parser is not configured")
+            self.config.require_remote_parser()
+            return (self.remote,)
+        if provider != "auto":
+            raise ValueError(f"unknown parser provider: {provider}")
+        candidates: list[ParserProvider] = [self.local]
         if self.config.allow_remote_parser and self.remote is not None:
-            return self.remote
-        return self.local
+            candidates.append(self.remote)
+        return tuple(candidates)
 
     def parse(self, source: Path, *, document_id: str, revision_id: str) -> DocumentIR:
-        return self.choose(source).parse(source, document_id=document_id, revision_id=revision_id)
+        candidate = self.parse_candidates(source, document_id=document_id, revision_id=revision_id)[0]
+        return candidate.parse(source, document_id=document_id, revision_id=revision_id)
 

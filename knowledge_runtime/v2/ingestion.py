@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import hashlib
 import base64
+import hashlib
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -47,6 +47,14 @@ class IngestionResult:
     history: tuple[str, ...] = ()
     error: str | None = None
     quality: QualityDecision | None = None
+    diagnostics: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _ParseSelection:
+    ir: DocumentIR | None
+    decision: QualityDecision
+    attempts: tuple[dict[str, Any], ...]
 
 
 class IngestionService:
@@ -102,28 +110,36 @@ class IngestionService:
                 )
                 history.append("ARTIFACT_STORED")
 
-            ir = self._parse(path, provider=provider, document_id=document_id, revision_id=revision_id)
-            if source_artifact is not None:
-                ir = replace(ir, source_artifacts=(*ir.source_artifacts, source_artifact))
-            history.append("PARSED")
-
-            if self.artifacts is not None:
-                ir_artifact = self.artifacts.put_bytes(
-                    document_id=document_id,
-                    revision_id=revision_id,
-                    name="document-ir.json",
-                    data=document_ir_bytes(ir),
-                    media_type="application/json",
-                    kind="document-ir",
-                )
-                ir = replace(ir, source_artifacts=(*ir.source_artifacts, ir_artifact))
-                history.append("DOCUMENT_IR_ARTIFACT_STORED")
-
-            decision = self.quality.evaluate(ir.parse_report)
+            selection = self._select_parser(path, provider=provider, document_id=document_id, revision_id=revision_id)
+            ir = selection.ir
+            decision = selection.decision
+            diagnostics = {"parse_attempts": [dict(attempt) for attempt in selection.attempts]}
+            if ir is not None:
+                if source_artifact is not None:
+                    ir = replace(ir, source_artifacts=(*ir.source_artifacts, source_artifact))
+                history.append("PARSED")
+                if self.artifacts is not None:
+                    ir_artifact = self.artifacts.put_bytes(
+                        document_id=document_id,
+                        revision_id=revision_id,
+                        name="document-ir.json",
+                        data=document_ir_bytes(ir),
+                        media_type="application/json",
+                        kind="document-ir",
+                    )
+                    ir = replace(ir, source_artifacts=(*ir.source_artifacts, ir_artifact))
+                    history.append("DOCUMENT_IR_ARTIFACT_STORED")
             history.append("QUALITY_CHECKED")
             if decision.action != "ACCEPTED":
                 history.append(decision.action)
-                self._record_job(ir, state=decision.action, history=history, error=decision.reason)
+                self._record_job(
+                    document_id=document_id,
+                    revision_id=revision_id,
+                    state=decision.action,
+                    history=history,
+                    error=decision.reason,
+                    diagnostics=diagnostics,
+                )
                 return IngestionResult(
                     document_id,
                     revision_id,
@@ -131,7 +147,11 @@ class IngestionService:
                     history=tuple(history),
                     quality=decision,
                     error=decision.reason,
+                    diagnostics=diagnostics,
                 )
+
+            if ir is None:
+                raise RuntimeError("accepted parser selection did not produce DocumentIR")
 
             self.canonical.put_revision(ir, source_hash=source_hash)
             self.canonical.record_artifacts(ir.document_id, ir.revision_id, ir.source_artifacts)
@@ -166,12 +186,20 @@ class IngestionService:
                     remove_revision(committed_ir.document_id, committed_ir.revision_id)
                 raise
             history.extend(("CURRENT_REVISION_PUBLISHED", "SEMANTIC_ENRICHMENT_PENDING"))
-            self._record_job(committed_ir, state="SEMANTIC_ENRICHMENT_PENDING", history=history)
+            self._record_job(
+                document_id=committed_ir.document_id,
+                revision_id=committed_ir.revision_id,
+                state="SEMANTIC_ENRICHMENT_PENDING",
+                history=history,
+                diagnostics=diagnostics,
+            )
             return IngestionResult(
                 committed_ir.document_id,
                 committed_ir.revision_id,
                 "CURRENT_REVISION_PUBLISHED",
                 history=tuple(history),
+                quality=decision,
+                diagnostics=diagnostics,
             )
         except Exception as exc:
             if not history or history[-1] != "FAILED":
@@ -185,27 +213,91 @@ class IngestionService:
                 error=str(exc),
             )
 
-    def _parse(self, path: Path, *, provider: str, document_id: str, revision_id: str) -> DocumentIR:
-        if provider == "local":
-            return self.router.local.parse(path, document_id=document_id, revision_id=revision_id)
-        if provider in {"remote", "mineru", "mineru-cloud"}:
-            if self.router.remote is None:
-                raise RuntimeError("remote parser is not configured")
-            return self.router.remote.parse(path, document_id=document_id, revision_id=revision_id)
-        return self.router.parse(path, document_id=document_id, revision_id=revision_id)
+    def _select_parser(
+        self,
+        path: Path,
+        *,
+        provider: str,
+        document_id: str,
+        revision_id: str,
+    ) -> _ParseSelection:
+        attempts: list[dict[str, Any]] = []
+        last_ir: DocumentIR | None = None
+        last_decision: QualityDecision | None = None
+        candidates = self.router.parse_candidates(
+            path,
+            document_id=document_id,
+            revision_id=revision_id,
+            provider=provider,
+        )
+        for candidate in candidates:
+            try:
+                candidate_ir = candidate.parse(path, document_id=document_id, revision_id=revision_id)
+            except Exception as exc:
+                attempts.append(
+                    {
+                        "provider": candidate.name,
+                        "outcome": "FAILED",
+                        "reason": _diagnostic_error(exc),
+                    }
+                )
+                continue
+            decision = self.quality.evaluate(candidate_ir.parse_report)
+            attempts.append(
+                {
+                    "provider": candidate.name,
+                    "outcome": decision.action,
+                    "reason": decision.reason,
+                    "parser_name": candidate_ir.parse_report.parser_name,
+                    "parser_version": candidate_ir.parse_report.parser_version,
+                    "egress_allowed": candidate_ir.parse_report.egress_allowed,
+                }
+            )
+            last_ir = candidate_ir
+            last_decision = decision
+            if decision.action == "ACCEPTED":
+                return _ParseSelection(
+                    ir=_annotate_parse_attempts(candidate_ir, attempts),
+                    decision=decision,
+                    attempts=tuple(attempts),
+                )
 
-    def _record_job(self, ir: DocumentIR, *, state: str, history: list[str], error: str | None = None) -> None:
+        if last_ir is None:
+            decision = QualityDecision("ESCALATED", "no_eligible_parser_succeeded")
+            return _ParseSelection(ir=None, decision=decision, attempts=tuple(attempts))
+        if last_decision is None or last_decision.action == "RETRY":
+            decision = QualityDecision("ESCALATED", "quality_below_threshold_no_eligible_fallback")
+        else:
+            decision = last_decision
+        return _ParseSelection(
+            ir=_annotate_parse_attempts(last_ir, attempts),
+            decision=decision,
+            attempts=tuple(attempts),
+        )
+
+    def _record_job(
+        self,
+        *,
+        document_id: str,
+        revision_id: str,
+        state: str,
+        history: list[str],
+        error: str | None = None,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> None:
         recorder = getattr(self.canonical, "record_ingestion_job", None)
         if recorder is not None:
             details: dict[str, Any] = {
-                "document_id": ir.document_id,
-                "revision_id": ir.revision_id,
+                "document_id": document_id,
+                "revision_id": revision_id,
                 "state": state,
                 "history": list(history),
             }
             if error:
                 details["error"] = error
-            recorder(f"ingest:{ir.document_id}:{ir.revision_id}", **details)
+            if diagnostics:
+                details["diagnostics"] = diagnostics
+            recorder(f"ingest:{document_id}:{revision_id}", **details)
 
     def _record_failure(self, document_id: str, revision_id: str, error: str, history: list[str]) -> None:
         recorder = getattr(self.canonical, "record_ingestion_job", None)
@@ -218,6 +310,19 @@ class IngestionService:
                 error=error,
                 history=list(history),
             )
+
+
+def _annotate_parse_attempts(ir: DocumentIR, attempts: list[dict[str, Any]]) -> DocumentIR:
+    metadata = {**dict(ir.metadata), "parse_attempts": [dict(attempt) for attempt in attempts]}
+    warnings = tuple(ir.parse_report.warnings) + tuple(
+        f"parse_attempt:{attempt['provider']}:{attempt['outcome']}" for attempt in attempts
+    )
+    return replace(ir, metadata=metadata, parse_report=replace(ir.parse_report, warnings=warnings))
+
+
+def _diagnostic_error(exc: Exception) -> str:
+    message = str(exc).replace("\n", " ").strip()
+    return f"{type(exc).__name__}: {message[:300]}" if message else type(exc).__name__
 
 
 def document_ir_bytes(ir: DocumentIR) -> bytes:

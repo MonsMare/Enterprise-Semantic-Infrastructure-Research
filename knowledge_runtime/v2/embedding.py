@@ -55,14 +55,20 @@ class DashScopeEmbeddingGateway:
         self.config = config
         self.transport = transport or UrllibEmbeddingTransport()
         self.endpoint = config.embedding_base_url.rstrip("/") + "/embeddings"
-        self._cache: dict[tuple[str, str, str], list[float]] = {}
+        self._vector_dimension: int | None = None
+        self._cache: dict[tuple[str, str, str, int | None], list[float]] = {}
 
     @classmethod
     def from_env(cls, *, transport: EmbeddingTransport | None = None) -> "DashScopeEmbeddingGateway":
         return cls(config=RuntimeConfig.from_env(), transport=transport)
 
-    def _cache_key(self, text: str) -> tuple[str, str, str]:
-        return (hashlib.sha256(text.encode("utf-8")).hexdigest(), self.model, self.endpoint)
+    def _cache_key(self, text: str) -> tuple[str, str, str, int | None]:
+        return (
+            hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            self.model,
+            self.endpoint,
+            self._vector_dimension,
+        )
 
     def embed_batch(self, texts: Sequence[str]) -> list[list[float]]:
         values = [str(text) for text in texts]
@@ -96,6 +102,12 @@ class DashScopeEmbeddingGateway:
                 vector = [float(value) for value in row.get("embedding", [])]
                 if not vector:
                     raise RuntimeError("embedding response contains an empty vector")
+                if self._vector_dimension is None:
+                    self._vector_dimension = len(vector)
+                elif len(vector) != self._vector_dimension:
+                    raise RuntimeError(
+                        f"embedding response dimension {len(vector)} does not match cached dimension {self._vector_dimension}"
+                    )
                 self._cache[self._cache_key(text)] = vector
                 result[index] = list(vector)
         return [vector or [] for vector in result]

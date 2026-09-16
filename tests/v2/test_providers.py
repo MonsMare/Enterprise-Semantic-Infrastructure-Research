@@ -63,6 +63,26 @@ def test_private_router_does_not_select_remote_provider(tmp_path: Path) -> None:
     )
 
     assert router.choose(source).name == "local"
+    assert [candidate.name for candidate in router.parse_candidates(source, document_id="doc-1", revision_id="rev-1")] == ["local"]
+
+
+def test_auto_router_tries_local_before_explicitly_enabled_remote_provider(tmp_path: Path) -> None:
+    class Provider:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def parse(self, *args, **kwargs):
+            raise AssertionError("routing test must not parse")
+
+    source = tmp_path / "input.pdf"
+    source.write_bytes(b"%PDF-routing-test")
+    config = RuntimeConfig.test_private(allow_remote_parser=True)
+    router = ParserRouter(config=config, local=Provider("local"), remote=Provider("mineru-cloud"))
+
+    assert [candidate.name for candidate in router.parse_candidates(source, document_id="doc-1", revision_id="rev-1")] == [
+        "local",
+        "mineru-cloud",
+    ]
 
 
 def test_markdown_to_ir_rejects_cross_revision_elements() -> None:
