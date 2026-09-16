@@ -67,3 +67,14 @@ def test_runtime_bundle_reopens_persisted_semantic_proposals(tmp_path: Path) -> 
     second = build_runtime(config)
 
     assert [item.proposal_id for item in second.proposals.list_eligible()] == [proposal.proposal_id]
+
+
+def test_runtime_bundle_exposes_first_class_knowledge_access_runtime(tmp_path: Path) -> None:
+    source = tmp_path / "policy.md"
+    source.write_text("# Scope\n\nReserve margin applies to annuity risk.\n", encoding="utf-8")
+    runtime = build_runtime(RuntimeConfig.test_private(local_state_path=str(tmp_path / "runtime.sqlite")))
+    runtime.ingestion.ingest(source, provider="local")
+
+    hit = runtime.access.search("reserve margin").items[0]
+
+    assert runtime.access.read(hit.locator).content

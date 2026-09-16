@@ -48,6 +48,8 @@ class CanonicalStore(Protocol):
 
     def record_context_run(self, run_id: str, **details: Any) -> None: ...
 
+    def list_context_runs(self) -> list[dict[str, Any]]: ...
+
 
 class InMemoryCanonicalStore:
     """Deterministic canonical store used by the POC and contract tests.
@@ -187,6 +189,10 @@ class InMemoryCanonicalStore:
     def record_context_run(self, run_id: str, **details: Any) -> None:
         with self._lock:
             self._context_runs.append({"run_id": run_id, **details})
+
+    def list_context_runs(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(row) for row in sorted(self._context_runs, key=lambda row: str(row["run_id"]))]
 
     def index_state(self, index_version: str) -> str | None:
         with self._lock:
@@ -612,6 +618,13 @@ class SqliteCanonicalStore:
                 (run_id, _sqlite_json(details)),
             )
 
+    def list_context_runs(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT run_id, details_json FROM context_runs ORDER BY run_id"
+            ).fetchall()
+        return [{"run_id": str(row["run_id"]), **_json_value(row["details_json"])} for row in rows]
+
 
 class SchemaMigrator:
     """Apply numbered PostgreSQL migrations once, transactionally."""
@@ -987,6 +1000,15 @@ class PostgresCanonicalStore:
                     "ON CONFLICT (run_id) DO NOTHING",
                     (run_id, json.dumps(details, ensure_ascii=False)),
                 )
+
+    def list_context_runs(self) -> list[dict[str, Any]]:
+        with self.connection.cursor() as cursor:
+            cursor.execute("SELECT run_id, details_json FROM context_runs ORDER BY run_id")
+            rows = cursor.fetchall()
+        return [
+            {"run_id": str(row[0]), **_json_value(row[1])}
+            for row in rows
+        ]
 
 
 def _revision_from_row(row: Any) -> DocumentRevision:

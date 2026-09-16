@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .access import KnowledgeAccessRuntime
 from .artifacts import ArtifactStore, FilesystemArtifactStore, S3ArtifactStore
 from .canonical import CanonicalStore, PostgresCanonicalStore, SqliteCanonicalStore
 from .config import RuntimeConfig
@@ -29,6 +30,7 @@ class RuntimeBundle:
     artifacts: ArtifactStore
     index: IndexBackend
     context: ContextRuntime
+    access: KnowledgeAccessRuntime
     ingestion: IngestionService
     proposals: ProposalStore
     semantic_worker: SemanticEnrichmentWorker
@@ -67,6 +69,7 @@ def build_runtime(
     remote = MinerUProvider(config=config) if config.allow_remote_parser else None
     router = ParserRouter(config=config, local=local, remote=remote)
     context = ContextRuntime(canonical=chosen_canonical, index=chosen_index, overlay=chosen_proposals)
+    access = KnowledgeAccessRuntime(context)
     ingestion = IngestionService(
         router=router,
         quality=None,
@@ -80,6 +83,7 @@ def build_runtime(
         artifacts=chosen_artifacts,
         index=chosen_index,
         context=context,
+        access=access,
         ingestion=ingestion,
         proposals=chosen_proposals,
         semantic_worker=semantic_worker,

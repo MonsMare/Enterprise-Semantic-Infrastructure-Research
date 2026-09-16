@@ -15,6 +15,7 @@ from .contracts import (
 )
 from .config import RuntimeConfig
 from .context import ContextRuntime, RetrievalBudget
+from .access import KnowledgeAccessRuntime
 from .runtime import RuntimeBundle, build_runtime
 
 __all__ = [
@@ -30,6 +31,7 @@ __all__ = [
     "ParseReport",
     "RuntimeConfig",
     "ContextRuntime",
+    "KnowledgeAccessRuntime",
     "RetrievalBudget",
     "RuntimeBundle",
     "build_runtime",

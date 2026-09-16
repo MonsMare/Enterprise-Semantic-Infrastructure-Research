@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Sequence
 
-from ..errors import KRStaleLocator
+from ..errors import KRLimitExceeded, KRStaleLocator
 from .canonical import CanonicalStore
 from .contracts import (
     AssetSearchPage,
@@ -75,10 +75,18 @@ class ContextRuntime:
     context only through ``get_evidence`` after the caller chooses a ref.
     """
 
-    def __init__(self, *, canonical: CanonicalStore, index: IndexBackend, overlay: Any | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        canonical: CanonicalStore,
+        index: IndexBackend,
+        overlay: Any | None = None,
+        audit_query_text: bool = False,
+    ) -> None:
         self.canonical = canonical
         self.index = index
         self.overlay = overlay
+        self.audit_query_text = audit_query_text
 
     def search_evidence(
         self,
@@ -141,7 +149,14 @@ class ContextRuntime:
             proposals = [proposal for proposal in proposals if str(proposal.payload.get("subject_id", "")) == subject_id]
         return proposals[:limit]
 
-    def get_evidence(self, ref: EvidenceRef, *, max_bytes: int = 20_000, representation: str = "structured") -> Evidence:
+    def get_evidence(
+        self,
+        ref: EvidenceRef,
+        *,
+        max_bytes: int = 20_000,
+        representation: str = "structured",
+        budget: RetrievalBudget | None = None,
+    ) -> Evidence:
         current = self.canonical.current_revision(ref.document_id)
         if current is not None and current != ref.revision_id:
             raise KRStaleLocator(
@@ -164,15 +179,32 @@ class ContextRuntime:
             },
             max_bytes=max_bytes,
         )
+        byte_count = len(evidence.content.encode("utf-8")) if isinstance(evidence.content, str) else len(evidence.content)
+        if budget is not None and not budget.accept(evidence.evidence_id, evidence.content_hash, byte_count):
+            self._record(
+                primitive="get_evidence",
+                query="",
+                refs=(ref,),
+                started=time.perf_counter(),
+                outcome="BUDGET_EXCEEDED",
+                diagnostics={"truncated": evidence.truncated, "byte_count": byte_count},
+                budget=_budget_details(budget),
+            )
+            raise KRLimitExceeded("retrieval Evidence budget exceeded")
         self._record(
             primitive="get_evidence",
             query="",
             refs=(ref,),
             started=time.perf_counter(),
             outcome="OK",
-            diagnostics={"truncated": evidence.truncated},
+            diagnostics={"truncated": evidence.truncated, "byte_count": byte_count},
+            budget=_budget_details(budget),
         )
         return evidence
+
+    def list_audit_records(self) -> list[dict[str, Any]]:
+        reader = getattr(self.canonical, "list_context_runs", None)
+        return reader() if reader is not None else []
 
     def _record(
         self,
@@ -183,20 +215,25 @@ class ContextRuntime:
         started: float,
         outcome: str,
         diagnostics: dict[str, Any],
+        budget: dict[str, Any] | None = None,
     ) -> None:
         run_id = "ctx-" + hashlib.sha256(
             f"{primitive}\x00{query}\x00{','.join(ref.to_json() for ref in refs)}\x00{time.time_ns()}".encode("utf-8")
         ).hexdigest()[:24]
+        stored_diagnostics = dict(diagnostics)
+        if query:
+            stored_diagnostics.setdefault("query_sha256", hashlib.sha256(query.encode("utf-8")).hexdigest())
+            stored_diagnostics.setdefault("query_length", len(query))
         record = ContextRunRecord(
             run_id=run_id,
             primitive=primitive,
-            query=query,
+            query=query if self.audit_query_text else "",
             evidence_refs=refs,
-            budget={},
+            budget=budget or {},
             started_at=datetime.now(timezone.utc).isoformat(),
             duration_ms=(time.perf_counter() - started) * 1000,
             outcome=outcome,
-            diagnostics=diagnostics,
+            diagnostics=stored_diagnostics,
         )
         recorder = getattr(self.canonical, "record_context_run", None)
         if recorder is not None:
@@ -211,3 +248,14 @@ class ContextRuntime:
                 outcome=record.outcome,
                 diagnostics=record.diagnostics,
             )
+
+
+def _budget_details(budget: RetrievalBudget | None) -> dict[str, Any]:
+    if budget is None:
+        return {}
+    return {
+        "max_evidence": budget.max_evidence,
+        "max_bytes": budget.max_bytes,
+        "evidence_count": len(budget.evidence_ids),
+        "bytes_used": budget.bytes_used,
+    }

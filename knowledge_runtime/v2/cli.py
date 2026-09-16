@@ -8,7 +8,8 @@ from typing import Sequence
 from .agent import AgentBudget, AgentRetrievalLoop, QwenAgentClient
 from .canonical import SchemaMigrator
 from .config import RuntimeConfig
-from .contracts import EvidenceRef, EvidenceSearchRequest, IndexRebuildRequest
+from .contracts import IndexRebuildRequest
+from ..models import Locator, ReadOptions, SearchOptions
 from .runtime import RuntimeBundle, build_runtime
 
 
@@ -56,6 +57,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     index = runtime.index
     service = runtime.ingestion
     context = runtime.context
+    access = runtime.access
     command = args.v2_command
     if command == "schema-migrate":
         if not config.database_url:
@@ -71,11 +73,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({"document_id": result.document_id, "revision_id": result.revision_id, "state": result.state, "reused": result.reused, "error": result.error}, ensure_ascii=False))
         return 0 if result.state == "CURRENT_REVISION_PUBLISHED" else 2
     if command == "search":
-        page = context.search_evidence(args.query, limit=args.limit)
-        print(json.dumps({"items": [{"ref": item.ref.as_dict(), "display_name": item.display_name, "score": item.score} for item in page.items], "next_cursor": page.next_cursor}, ensure_ascii=False))
+        page = access.search(args.query, options=SearchOptions(limit=args.limit))
+        print(json.dumps({"items": [{"ref": access.to_evidence_ref(item.locator).as_dict(), "display_name": item.display_name} for item in page.items], "next_cursor": page.next_cursor}, ensure_ascii=False))
         return 0
     if command == "evidence":
-        evidence = context.get_evidence(EvidenceRef(args.document_id, args.revision_id, args.element_id), max_bytes=args.max_bytes)
+        evidence = access.read(
+            Locator(1, access.provider_id, args.document_id, args.revision_id, {"element_id": args.element_id}),
+            ReadOptions(max_bytes=args.max_bytes, representation="structured"),
+        )
         print(json.dumps(evidence.as_model_input(), ensure_ascii=False))
         return 0
     if command == "ask":

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from knowledge_runtime.errors import KRStaleLocator
+from knowledge_runtime.errors import KRLimitExceeded, KRStaleLocator
 from knowledge_runtime.v2.canonical import InMemoryCanonicalStore
 from knowledge_runtime.v2.chunking import ChunkSetBuilder
 from knowledge_runtime.v2.context import ContextRuntime, RetrievalBudget
@@ -55,3 +55,26 @@ def test_get_evidence_rejects_stale_revision() -> None:
     runtime = make_runtime()
     with pytest.raises(KRStaleLocator):
         runtime.get_evidence(EvidenceRef("doc-1", "old-rev", "el-1"), max_bytes=100)
+
+
+def test_context_audit_is_redacted_by_default() -> None:
+    runtime = make_runtime()
+    runtime.search_evidence("reserve margin", limit=5)
+
+    records = runtime.list_audit_records()
+
+    assert records[-1]["query"] == ""
+    assert records[-1]["diagnostics"]["query_sha256"]
+    assert "reserve margin" not in str(records[-1])
+
+
+def test_evidence_budget_is_enforced_and_audited() -> None:
+    runtime = make_runtime()
+    ref = runtime.search_evidence("reserve margin", limit=1).items[0].ref
+
+    with pytest.raises(KRLimitExceeded):
+        runtime.get_evidence(ref, max_bytes=10_000, budget=RetrievalBudget(max_evidence=1, max_bytes=10))
+
+    record = runtime.list_audit_records()[-1]
+    assert record["outcome"] == "BUDGET_EXCEEDED"
+    assert record["budget"]["max_bytes"] == 10
