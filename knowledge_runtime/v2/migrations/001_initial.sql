@@ -95,4 +95,8 @@ CREATE INDEX IF NOT EXISTS idx_document_elements_content_hash
     ON document_elements(content_hash);
 CREATE INDEX IF NOT EXISTS idx_document_revisions_document
     ON document_revisions(document_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_artifact_refs_revision
+    ON artifact_refs(document_id, revision_id, object_key);
+CREATE INDEX IF NOT EXISTS idx_ingestion_jobs_document
+    ON ingestion_jobs(document_id, revision_id, job_id);
 

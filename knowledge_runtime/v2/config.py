@@ -26,6 +26,7 @@ class RuntimeConfig:
     local_model_base_url: str = ""
     local_model_name: str = ""
     database_url: str = ""
+    local_state_path: str = ".kr-v2-data/canonical.sqlite"
     artifact_endpoint: str = ""
     artifact_bucket: str = "kr-v2-artifacts"
     opensearch_url: str = ""
@@ -57,6 +58,7 @@ class RuntimeConfig:
             local_model_base_url=os.environ.get("KR_LOCAL_MODEL_BASE_URL", ""),
             local_model_name=os.environ.get("KR_LOCAL_MODEL_NAME", ""),
             database_url=os.environ.get("KR_DATABASE_URL", ""),
+            local_state_path=os.environ.get("KR_LOCAL_STATE_PATH", ".kr-v2-data/canonical.sqlite"),
             artifact_endpoint=os.environ.get("KR_ARTIFACT_ENDPOINT", ""),
             artifact_bucket=os.environ.get("KR_ARTIFACT_BUCKET", "kr-v2-artifacts"),
             opensearch_url=os.environ.get("KR_OPENSEARCH_URL", ""),

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from knowledge_runtime.v2.canonical import InMemoryCanonicalStore
+from knowledge_runtime.v2.canonical import InMemoryCanonicalStore, SqliteCanonicalStore
 from knowledge_runtime.v2.contracts import DocumentElement, DocumentIR, ParseReport, content_hash
 
 
@@ -68,4 +68,28 @@ def test_store_returns_immutable_ir_and_revision_lookup() -> None:
     assert store.get_revision("doc-1", "rev-1").source_name == "policy.md"
     assert store.get_ir("doc-1", "rev-1") == ir
     assert store.get_element("doc-1", "rev-1", "el-rev-1") == ir.elements[0]
+
+
+def test_sqlite_store_persists_publication_and_ingestion_job_across_reopen(tmp_path) -> None:
+    database = tmp_path / "canonical.sqlite"
+    store = SqliteCanonicalStore(database)
+    ir = make_ir("rev-1")
+    store.put_revision(ir, source_hash="src-1")
+    store.record_index_run("idx-1", state="SUCCEEDED")
+    store.begin_publication(ir.document_id, ir.revision_id, index_version="idx-1")
+    store.publish_current(ir.document_id, ir.revision_id, index_version="idx-1")
+    store.record_ingestion_job(
+        "ingest:doc-1:rev-1",
+        document_id="doc-1",
+        revision_id="rev-1",
+        state="SEMANTIC_ENRICHMENT_PENDING",
+        history=("RECEIVED", "CURRENT_REVISION_PUBLISHED", "SEMANTIC_ENRICHMENT_PENDING"),
+    )
+    store.close()
+
+    reopened = SqliteCanonicalStore(database)
+
+    assert reopened.current_revision("doc-1") == "rev-1"
+    assert reopened.get_ir("doc-1", "rev-1") == ir
+    assert reopened.list_ingestion_jobs("doc-1")[0]["history"][-1] == "SEMANTIC_ENRICHMENT_PENDING"
 

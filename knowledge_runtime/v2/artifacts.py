@@ -19,7 +19,16 @@ def _safe_component(value: str) -> str:
 
 
 class ArtifactStore(Protocol):
-    def put_bytes(self, *, document_id: str, revision_id: str, name: str, data: bytes, media_type: str) -> ArtifactRef: ...
+    def put_bytes(
+        self,
+        *,
+        document_id: str,
+        revision_id: str,
+        name: str,
+        data: bytes,
+        media_type: str,
+        kind: str | None = None,
+    ) -> ArtifactRef: ...
 
     def get_bytes(self, ref: ArtifactRef) -> bytes: ...
 
@@ -38,7 +47,16 @@ class FilesystemArtifactStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
-    def put_bytes(self, *, document_id: str, revision_id: str, name: str, data: bytes, media_type: str) -> ArtifactRef:
+    def put_bytes(
+        self,
+        *,
+        document_id: str,
+        revision_id: str,
+        name: str,
+        data: bytes,
+        media_type: str,
+        kind: str | None = None,
+    ) -> ArtifactRef:
         key = artifact_key(document_id, revision_id, name)
         digest = hashlib.sha256(data).hexdigest()
         path = self._path(key)
@@ -54,7 +72,7 @@ class FilesystemArtifactStore:
             media_type=media_type,
             sha256=digest,
             size_bytes=len(data),
-            kind=object_name(name),
+            kind=kind or object_name(name),
             revision_id=revision_id,
         )
 
@@ -92,7 +110,16 @@ class S3ArtifactStore:
         self.client = client
         self.bucket = bucket
 
-    def put_bytes(self, *, document_id: str, revision_id: str, name: str, data: bytes, media_type: str) -> ArtifactRef:
+    def put_bytes(
+        self,
+        *,
+        document_id: str,
+        revision_id: str,
+        name: str,
+        data: bytes,
+        media_type: str,
+        kind: str | None = None,
+    ) -> ArtifactRef:
         key = artifact_key(document_id, revision_id, name)
         digest = hashlib.sha256(data).hexdigest()
         try:
@@ -121,7 +148,7 @@ class S3ArtifactStore:
             media_type=media_type,
             sha256=digest,
             size_bytes=len(data),
-            kind=object_name(name),
+            kind=kind or object_name(name),
             revision_id=revision_id,
         )
 

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import threading
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -39,6 +40,14 @@ class CanonicalStore(Protocol):
 
     def list_revisions(self, document_id: str) -> list[DocumentRevision]: ...
 
+    def record_artifacts(self, document_id: str, revision_id: str, refs: Iterable[ArtifactRef]) -> None: ...
+
+    def record_ingestion_job(self, job_id: str, **details: Any) -> None: ...
+
+    def list_ingestion_jobs(self, document_id: str | None = None) -> list[dict[str, Any]]: ...
+
+    def record_context_run(self, run_id: str, **details: Any) -> None: ...
+
 
 class InMemoryCanonicalStore:
     """Deterministic canonical store used by the POC and contract tests.
@@ -56,7 +65,7 @@ class InMemoryCanonicalStore:
         self._current: dict[str, str] = {}
         self._publication: dict[tuple[str, str], str] = {}
         self._index_runs: dict[str, dict[str, Any]] = {}
-        self._ingestion_jobs: list[dict[str, Any]] = []
+        self._ingestion_jobs: dict[str, dict[str, Any]] = {}
         self._context_runs: list[dict[str, Any]] = []
 
     def put_revision(self, ir: DocumentIR, *, source_hash: str) -> None:
@@ -151,9 +160,29 @@ class InMemoryCanonicalStore:
                 key=lambda revision: revision.created_at,
             )
 
+    def record_artifacts(self, document_id: str, revision_id: str, refs: Iterable[ArtifactRef]) -> None:
+        key = (document_id, revision_id)
+        with self._lock:
+            ir = self._irs.get(key)
+            if ir is None:
+                raise KeyError(f"unknown revision {document_id}/{revision_id}")
+            existing = {ref.artifact_id: ref for ref in ir.source_artifacts}
+            for ref in refs:
+                if ref.revision_id != revision_id:
+                    raise ValueError("artifact revision does not match canonical revision")
+                existing.setdefault(ref.artifact_id, ref)
+            self._irs[key] = replace(ir, source_artifacts=tuple(sorted(existing.values(), key=lambda ref: ref.object_key)))
+
     def record_ingestion_job(self, job_id: str, **details: Any) -> None:
         with self._lock:
-            self._ingestion_jobs.append({"job_id": job_id, **details})
+            self._ingestion_jobs[job_id] = {"job_id": job_id, **details}
+
+    def list_ingestion_jobs(self, document_id: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._ingestion_jobs.values()
+            if document_id is not None:
+                rows = (row for row in rows if row.get("document_id") == document_id)
+            return [dict(row) for row in sorted(rows, key=lambda row: str(row["job_id"]))]
 
     def record_context_run(self, run_id: str, **details: Any) -> None:
         with self._lock:
@@ -163,6 +192,425 @@ class InMemoryCanonicalStore:
         with self._lock:
             row = self._index_runs.get(index_version)
             return row.get("state") if row else None
+
+
+class SqliteCanonicalStore:
+    """Durable local implementation of the canonical Evidence contract.
+
+    SQLite is deliberately used only as the POC/developer canonical store. It
+    persists the same immutable revision facts as PostgreSQL, while the local
+    in-memory index remains a rebuildable derived view.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        raw_path = str(path)
+        self.path = Path(raw_path)
+        if raw_path != ":memory:":
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self.connection = sqlite3.connect(raw_path, check_same_thread=False)
+        self.connection.row_factory = sqlite3.Row
+        with self._lock:
+            self.connection.execute("PRAGMA foreign_keys = ON")
+            self.connection.execute("PRAGMA journal_mode = WAL")
+            self._create_schema()
+
+    def _create_schema(self) -> None:
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                document_id TEXT PRIMARY KEY,
+                current_revision_id TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS document_revisions (
+                document_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                source_hash TEXT NOT NULL UNIQUE,
+                source_name TEXT NOT NULL,
+                parser_name TEXT NOT NULL,
+                parser_version TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY (document_id, revision_id),
+                FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS document_elements (
+                document_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                element_id TEXT NOT NULL,
+                element_type TEXT NOT NULL,
+                text TEXT NOT NULL,
+                section_path_json TEXT NOT NULL DEFAULT '[]',
+                page INTEGER,
+                bbox_json TEXT,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                confidence REAL,
+                content_hash TEXT NOT NULL,
+                PRIMARY KEY (document_id, revision_id, element_id),
+                FOREIGN KEY (document_id, revision_id)
+                    REFERENCES document_revisions(document_id, revision_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS parse_reports (
+                document_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                report_json TEXT NOT NULL,
+                PRIMARY KEY (document_id, revision_id),
+                FOREIGN KEY (document_id, revision_id)
+                    REFERENCES document_revisions(document_id, revision_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS artifact_refs (
+                artifact_id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                object_key TEXT NOT NULL UNIQUE,
+                media_type TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                FOREIGN KEY (document_id, revision_id)
+                    REFERENCES document_revisions(document_id, revision_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS ingestion_jobs (
+                job_id TEXT PRIMARY KEY,
+                document_id TEXT,
+                revision_id TEXT,
+                state TEXT NOT NULL,
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS index_runs (
+                index_version TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS context_runs (
+                run_id TEXT PRIMARY KEY,
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_sqlite_document_revisions_document
+                ON document_revisions(document_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_sqlite_artifact_refs_revision
+                ON artifact_refs(document_id, revision_id, object_key);
+            CREATE INDEX IF NOT EXISTS idx_sqlite_ingestion_jobs_document
+                ON ingestion_jobs(document_id, job_id);
+            """
+        )
+        self.connection.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self.connection.close()
+
+    def put_revision(self, ir: DocumentIR, *, source_hash: str) -> None:
+        if not source_hash:
+            raise ValueError("source_hash is required")
+        source_name = str(ir.metadata.get("source_name", ir.document_id))
+        created_at = _now()
+        with self._lock, self.connection:
+            cursor = self.connection.cursor()
+            existing = cursor.execute(
+                "SELECT source_hash FROM document_revisions WHERE document_id=? AND revision_id=?",
+                (ir.document_id, ir.revision_id),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["source_hash"]) != source_hash:
+                    raise ValueError("revision already exists with a different source hash")
+                return
+            duplicate = cursor.execute(
+                "SELECT document_id, revision_id FROM document_revisions WHERE source_hash=?",
+                (source_hash,),
+            ).fetchone()
+            if duplicate is not None:
+                raise ValueError("source hash already belongs to another revision")
+            cursor.execute(
+                "INSERT OR IGNORE INTO documents(document_id, current_revision_id, metadata_json) VALUES (?, NULL, ?)",
+                (ir.document_id, _sqlite_json(dict(ir.metadata))),
+            )
+            cursor.execute(
+                """
+                INSERT INTO document_revisions
+                (document_id, revision_id, source_hash, source_name, parser_name, parser_version, state, created_at, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, 'COMMITTED', ?, ?)
+                """,
+                (
+                    ir.document_id,
+                    ir.revision_id,
+                    source_hash,
+                    source_name,
+                    ir.parse_report.parser_name,
+                    ir.parse_report.parser_version,
+                    created_at,
+                    _sqlite_json(dict(ir.metadata)),
+                ),
+            )
+            cursor.execute(
+                "INSERT INTO parse_reports(document_id, revision_id, report_json) VALUES (?, ?, ?)",
+                (ir.document_id, ir.revision_id, _sqlite_json(_report_json(ir.parse_report))),
+            )
+            for element in ir.elements:
+                cursor.execute(
+                    """
+                    INSERT INTO document_elements
+                    (document_id, revision_id, element_id, element_type, text, section_path_json,
+                     page, bbox_json, payload_json, provenance_json, confidence, content_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ir.document_id,
+                        ir.revision_id,
+                        element.element_id,
+                        element.element_type,
+                        element.text,
+                        _sqlite_json(list(element.section_path)),
+                        element.page,
+                        _sqlite_json(list(element.bbox)) if element.bbox else None,
+                        _sqlite_json(dict(element.payload)),
+                        _sqlite_json(dict(element.provenance)),
+                        element.confidence,
+                        element.content_hash,
+                    ),
+                )
+            self._record_artifacts(cursor, ir.document_id, ir.revision_id, ir.source_artifacts)
+
+    def _record_artifacts(
+        self,
+        cursor: sqlite3.Cursor,
+        document_id: str,
+        revision_id: str,
+        refs: Iterable[ArtifactRef],
+    ) -> None:
+        for artifact in refs:
+            if artifact.revision_id != revision_id:
+                raise ValueError("artifact revision does not match canonical revision")
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO artifact_refs
+                (artifact_id, document_id, revision_id, object_key, media_type, sha256, size_bytes, kind)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact.artifact_id,
+                    document_id,
+                    revision_id,
+                    artifact.object_key,
+                    artifact.media_type,
+                    artifact.sha256,
+                    artifact.size_bytes,
+                    artifact.kind,
+                ),
+            )
+
+    def record_artifacts(self, document_id: str, revision_id: str, refs: Iterable[ArtifactRef]) -> None:
+        self.get_revision(document_id, revision_id)
+        with self._lock, self.connection:
+            self._record_artifacts(self.connection.cursor(), document_id, revision_id, refs)
+
+    def find_revision_by_source_hash(self, source_hash: str) -> DocumentRevision | None:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT document_id, revision_id, source_hash, source_name, parser_name, parser_version, state, created_at "
+                "FROM document_revisions WHERE source_hash=?",
+                (source_hash,),
+            ).fetchone()
+        return _revision_from_row(row) if row else None
+
+    def get_revision(self, document_id: str, revision_id: str) -> DocumentRevision:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT document_id, revision_id, source_hash, source_name, parser_name, parser_version, state, created_at "
+                "FROM document_revisions WHERE document_id=? AND revision_id=?",
+                (document_id, revision_id),
+            ).fetchone()
+        if not row:
+            raise KeyError(f"unknown revision {document_id}/{revision_id}")
+        return _revision_from_row(row)
+
+    def get_element(self, document_id: str, revision_id: str, element_id: str) -> DocumentElement:
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT element_id, revision_id, element_type, text, section_path_json, page, bbox_json,
+                       payload_json, provenance_json, confidence, content_hash
+                FROM document_elements WHERE document_id=? AND revision_id=? AND element_id=?
+                """,
+                (document_id, revision_id, element_id),
+            ).fetchone()
+        if not row:
+            raise KeyError(f"unknown element {element_id}")
+        return _element_from_row(row)
+
+    def get_ir(self, document_id: str, revision_id: str) -> DocumentIR:
+        with self._lock:
+            revision = self.connection.execute(
+                "SELECT metadata_json FROM document_revisions WHERE document_id=? AND revision_id=?",
+                (document_id, revision_id),
+            ).fetchone()
+            if revision is None:
+                raise KeyError(f"unknown revision {document_id}/{revision_id}")
+            elements = self.connection.execute(
+                """
+                SELECT element_id, revision_id, element_type, text, section_path_json, page, bbox_json,
+                       payload_json, provenance_json, confidence, content_hash
+                FROM document_elements WHERE document_id=? AND revision_id=?
+                ORDER BY page IS NOT NULL, page, element_id
+                """,
+                (document_id, revision_id),
+            ).fetchall()
+            report = self.connection.execute(
+                "SELECT report_json FROM parse_reports WHERE document_id=? AND revision_id=?",
+                (document_id, revision_id),
+            ).fetchone()
+            artifacts = self.connection.execute(
+                """
+                SELECT artifact_id, object_key, media_type, sha256, size_bytes, kind, revision_id
+                FROM artifact_refs WHERE document_id=? AND revision_id=? ORDER BY object_key
+                """,
+                (document_id, revision_id),
+            ).fetchall()
+        report_data = _json_value(report["report_json"] if report else "{}")
+        return DocumentIR(
+            document_id=document_id,
+            revision_id=revision_id,
+            metadata=_json_value(revision["metadata_json"]),
+            elements=tuple(_element_from_row(row) for row in elements),
+            parse_report=_report_from_json(report_data),
+            source_artifacts=tuple(_artifact_from_row(row) for row in artifacts),
+        )
+
+    def current_revision(self, document_id: str) -> str | None:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT current_revision_id FROM documents WHERE document_id=?", (document_id,)
+            ).fetchone()
+        return str(row["current_revision_id"]) if row and row["current_revision_id"] else None
+
+    def begin_publication(self, document_id: str, revision_id: str, *, index_version: str) -> None:
+        self.get_revision(document_id, revision_id)
+        self.record_ingestion_job(
+            f"publication:{document_id}:{revision_id}",
+            document_id=document_id,
+            revision_id=revision_id,
+            state="PUBLICATION_PENDING",
+            index_version=index_version,
+        )
+
+    def record_index_run(self, index_version: str, *, state: str, **details: Any) -> None:
+        if state not in {"PENDING", "RUNNING", "SUCCEEDED", "FAILED"}:
+            raise ValueError(f"invalid index state: {state}")
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO index_runs(index_version, state, details_json) VALUES (?, ?, ?)
+                ON CONFLICT(index_version) DO UPDATE SET state=excluded.state, details_json=excluded.details_json
+                """,
+                (index_version, state, _sqlite_json(details)),
+            )
+
+    def index_state(self, index_version: str) -> str | None:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT state FROM index_runs WHERE index_version=?", (index_version,)
+            ).fetchone()
+        return str(row["state"]) if row else None
+
+    def publish_current(self, document_id: str, revision_id: str, *, index_version: str) -> None:
+        with self._lock, self.connection:
+            cursor = self.connection.cursor()
+            document = cursor.execute(
+                "SELECT document_id FROM documents WHERE document_id=?", (document_id,)
+            ).fetchone()
+            if document is None:
+                raise KeyError(document_id)
+            revision = cursor.execute(
+                "SELECT state FROM document_revisions WHERE document_id=? AND revision_id=?",
+                (document_id, revision_id),
+            ).fetchone()
+            if revision is None or str(revision["state"]) != "COMMITTED":
+                raise ValueError("revision is not committed")
+            index_run = cursor.execute(
+                "SELECT state FROM index_runs WHERE index_version=?", (index_version,)
+            ).fetchone()
+            if index_run is None or str(index_run["state"]) != "SUCCEEDED":
+                raise ValueError("cannot publish current revision before index succeeds")
+            cursor.execute(
+                "UPDATE documents SET current_revision_id=? WHERE document_id=?",
+                (revision_id, document_id),
+            )
+
+    def list_revisions(self, document_id: str) -> list[DocumentRevision]:
+        with self._lock:
+            rows = self.connection.execute(
+                """
+                SELECT document_id, revision_id, source_hash, source_name, parser_name, parser_version, state, created_at
+                FROM document_revisions WHERE document_id=? ORDER BY created_at, revision_id
+                """,
+                (document_id,),
+            ).fetchall()
+        return [_revision_from_row(row) for row in rows]
+
+    def list_current_documents(self) -> list[DocumentRevision]:
+        with self._lock:
+            rows = self.connection.execute(
+                """
+                SELECT r.document_id, r.revision_id, r.source_hash, r.source_name, r.parser_name,
+                       r.parser_version, r.state, r.created_at
+                FROM documents d JOIN document_revisions r
+                  ON r.document_id=d.document_id AND r.revision_id=d.current_revision_id
+                ORDER BY r.document_id
+                """
+            ).fetchall()
+        return [_revision_from_row(row) for row in rows]
+
+    def record_ingestion_job(self, job_id: str, **details: Any) -> None:
+        values = dict(details)
+        state = str(values.pop("state", "RECEIVED"))
+        document_id = values.pop("document_id", None)
+        revision_id = values.pop("revision_id", None)
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO ingestion_jobs(job_id, document_id, revision_id, state, details_json)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    document_id=excluded.document_id,
+                    revision_id=excluded.revision_id,
+                    state=excluded.state,
+                    details_json=excluded.details_json
+                """,
+                (job_id, document_id, revision_id, state, _sqlite_json(values)),
+            )
+
+    def list_ingestion_jobs(self, document_id: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT job_id, document_id, revision_id, state, details_json FROM ingestion_jobs"
+        params: tuple[str, ...] = ()
+        if document_id is not None:
+            query += " WHERE document_id=?"
+            params = (document_id,)
+        query += " ORDER BY job_id"
+        with self._lock:
+            rows = self.connection.execute(query, params).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            details = _json_value(row["details_json"])
+            result.append(
+                {
+                    "job_id": str(row["job_id"]),
+                    "document_id": row["document_id"],
+                    "revision_id": row["revision_id"],
+                    "state": str(row["state"]),
+                    **details,
+                }
+            )
+        return result
+
+    def record_context_run(self, run_id: str, **details: Any) -> None:
+        with self._lock, self.connection:
+            self.connection.execute(
+                "INSERT OR IGNORE INTO context_runs(run_id, details_json) VALUES (?, ?)",
+                (run_id, _sqlite_json(details)),
+            )
 
 
 class SchemaMigrator:
@@ -308,6 +756,33 @@ class PostgresCanonicalStore:
             )
             row = cursor.fetchone()
         return _revision_from_row(row) if row else None
+
+    def record_artifacts(self, document_id: str, revision_id: str, refs: Iterable[ArtifactRef]) -> None:
+        self.get_revision(document_id, revision_id)
+        with self.connection.transaction():
+            with self.connection.cursor() as cursor:
+                for artifact in refs:
+                    if artifact.revision_id != revision_id:
+                        raise ValueError("artifact revision does not match canonical revision")
+                    cursor.execute(
+                        """
+                        INSERT INTO artifact_refs
+                        (artifact_id, document_id, revision_id, object_key, media_type,
+                         sha256, size_bytes, kind)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (artifact_id) DO NOTHING
+                        """,
+                        (
+                            artifact.artifact_id,
+                            document_id,
+                            revision_id,
+                            artifact.object_key,
+                            artifact.media_type,
+                            artifact.sha256,
+                            artifact.size_bytes,
+                            artifact.kind,
+                        ),
+                    )
 
     def get_revision(self, document_id: str, revision_id: str) -> DocumentRevision:
         with self.connection.cursor() as cursor:
@@ -460,13 +935,49 @@ class PostgresCanonicalStore:
         return [_revision_from_row(row) for row in rows]
 
     def record_ingestion_job(self, job_id: str, **details: Any) -> None:
+        values = dict(details)
+        state = str(values.pop("state", "RECEIVED"))
+        document_id = values.pop("document_id", None)
+        revision_id = values.pop("revision_id", None)
         with self.connection.transaction():
             with self.connection.cursor() as cursor:
                 cursor.execute(
-                    "INSERT INTO ingestion_jobs(job_id, state, details_json) VALUES (%s, %s, %s::jsonb) "
-                    "ON CONFLICT (job_id) DO UPDATE SET state=EXCLUDED.state, details_json=EXCLUDED.details_json",
-                    (job_id, details.pop("state", "RECEIVED"), json.dumps(details, ensure_ascii=False)),
+                    """
+                    INSERT INTO ingestion_jobs(job_id, document_id, revision_id, state, details_json)
+                    VALUES (%s, %s, %s, %s, %s::jsonb)
+                    ON CONFLICT (job_id) DO UPDATE SET
+                        document_id=EXCLUDED.document_id,
+                        revision_id=EXCLUDED.revision_id,
+                        state=EXCLUDED.state,
+                        details_json=EXCLUDED.details_json
+                    """,
+                    (job_id, document_id, revision_id, state, json.dumps(values, ensure_ascii=False)),
                 )
+
+    def list_ingestion_jobs(self, document_id: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT job_id, document_id, revision_id, state, details_json FROM ingestion_jobs"
+        params: tuple[Any, ...] = ()
+        if document_id is not None:
+            query += " WHERE document_id=%s"
+            params = (document_id,)
+        query += " ORDER BY job_id"
+        with self.connection.cursor() as cursor:
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            values = list(row)
+            details = _json_value(values[4])
+            result.append(
+                {
+                    "job_id": str(values[0]),
+                    "document_id": values[1],
+                    "revision_id": values[2],
+                    "state": str(values[3]),
+                    **details,
+                }
+            )
+        return result
 
     def record_context_run(self, run_id: str, **details: Any) -> None:
         with self.connection.transaction():
@@ -512,6 +1023,10 @@ def _report_json(report: ParseReport) -> dict[str, Any]:
     }
 
 
+def _sqlite_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def _json_value(value: Any) -> Any:
     if isinstance(value, (dict, list, tuple)):
         return value
@@ -522,8 +1037,8 @@ def _json_value(value: Any) -> Any:
 
 def _element_from_row(row: Any) -> DocumentElement:
     values = list(row)
-    section_path = values[4] or ()
-    bbox = values[6]
+    section_path = _json_value(values[4]) or ()
+    bbox = _json_value(values[6]) if values[6] is not None else None
     return DocumentElement(
         element_id=str(values[0]),
         revision_id=str(values[1]),
@@ -536,6 +1051,19 @@ def _element_from_row(row: Any) -> DocumentElement:
         provenance=_json_value(values[8]),
         confidence=float(values[9]) if values[9] is not None else None,
         content_hash=str(values[10]),
+    )
+
+
+def _artifact_from_row(row: Any) -> ArtifactRef:
+    values = list(row)
+    return ArtifactRef(
+        artifact_id=str(values[0]),
+        object_key=str(values[1]),
+        media_type=str(values[2]),
+        sha256=str(values[3]),
+        size_bytes=int(values[4]),
+        kind=str(values[5]),
+        revision_id=str(values[6]),
     )
 
 

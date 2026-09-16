@@ -15,6 +15,7 @@ from .contracts import (
 )
 from .config import RuntimeConfig
 from .context import ContextRuntime, RetrievalBudget
+from .runtime import RuntimeBundle, build_runtime
 
 __all__ = [
     "ArtifactRef",
@@ -30,5 +31,7 @@ __all__ = [
     "RuntimeConfig",
     "ContextRuntime",
     "RetrievalBudget",
+    "RuntimeBundle",
+    "build_runtime",
     "content_hash",
 ]

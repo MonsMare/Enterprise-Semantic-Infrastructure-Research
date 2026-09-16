@@ -2,19 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import Sequence
 
 from .agent import AgentBudget, AgentRetrievalLoop, QwenAgentClient
-from .artifacts import FilesystemArtifactStore, S3ArtifactStore
-from .canonical import InMemoryCanonicalStore, PostgresCanonicalStore, SchemaMigrator
+from .canonical import SchemaMigrator
 from .config import RuntimeConfig
-from .context import ContextRuntime
 from .contracts import EvidenceRef, EvidenceSearchRequest, IndexRebuildRequest
-from .index import InMemoryIndexBackend, OpenSearchIndexBackend
-from .ingestion import IngestionService
-from .providers import LocalProvider, MinerUProvider, ParserRouter
+from .runtime import RuntimeBundle, build_runtime
 
 
 def v2_command_names() -> tuple[str, ...]:
@@ -49,59 +44,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _runtime(config: RuntimeConfig):
-    # The offline POC remains usable without services.  When explicit service
-    # endpoints are configured, the same contracts select the production
-    # adapters; no silent cross-provider fallback is performed.
-    canonical = PostgresCanonicalStore(config.database_url) if config.database_url else InMemoryCanonicalStore()
-    artifacts = _artifact_store(config)
-    local = LocalProvider(config)
-    remote = MinerUProvider(config=config) if config.allow_remote_parser else None
-    router = ParserRouter(config=config, local=local, remote=remote)
-    index = _index_store(config, canonical)
-    service = IngestionService(router=router, quality=None, canonical=canonical, artifacts=artifacts, index=index)
-    context = ContextRuntime(canonical=canonical, index=index)
-    return canonical, artifacts, index, service, context
-
-
-def _artifact_store(config: RuntimeConfig):
-    if not config.artifact_endpoint:
-        return FilesystemArtifactStore(Path(".kr-v2-data") / "artifacts")
-    try:
-        import boto3  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise RuntimeError("install the runtime extra to use the S3-compatible ArtifactStore") from exc
-    client = boto3.client(
-        "s3",
-        endpoint_url=config.artifact_endpoint,
-        aws_access_key_id=os.environ.get("KR_ARTIFACT_ACCESS_KEY", "minioadmin"),
-        aws_secret_access_key=os.environ.get("KR_ARTIFACT_SECRET_KEY", "minioadmin"),
-    )
-    return S3ArtifactStore(client=client, bucket=config.artifact_bucket)
-
-
-def _index_store(config: RuntimeConfig, canonical: object):
-    if not config.opensearch_url:
-        return InMemoryIndexBackend(canonical=canonical)
-    try:
-        from opensearchpy import OpenSearch  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise RuntimeError("install the runtime extra to use the OpenSearch IndexBackend") from exc
-    client = OpenSearch(config.opensearch_url)
-    return OpenSearchIndexBackend(client=client, index_name=f"{config.opensearch_index_prefix}-evidence", canonical=canonical)
+def _runtime(config: RuntimeConfig) -> RuntimeBundle:
+    return build_runtime(config)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
     config = RuntimeConfig.from_env()
-    canonical, artifacts, index, service, context = _runtime(config)
+    runtime = _runtime(config)
+    canonical = runtime.canonical
+    index = runtime.index
+    service = runtime.ingestion
+    context = runtime.context
     command = args.v2_command
     if command == "schema-migrate":
         if not config.database_url:
             print(json.dumps({"status": "skipped", "reason": "KR_DATABASE_URL is not configured"}))
             return 0
-        store = PostgresCanonicalStore(config.database_url)
-        print(json.dumps({"applied": SchemaMigrator(store.connection).apply()}))
+        connection = getattr(canonical, "connection", None)
+        if connection is None:
+            raise RuntimeError("configured canonical store does not expose a PostgreSQL connection")
+        print(json.dumps({"applied": SchemaMigrator(connection).apply()}))
         return 0
     if command == "ingest":
         result = service.ingest(args.source, document_id=args.document_id, provider=args.provider)

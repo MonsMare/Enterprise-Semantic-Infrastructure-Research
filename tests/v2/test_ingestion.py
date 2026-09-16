@@ -9,6 +9,7 @@ from knowledge_runtime.v2.index import InMemoryIndexBackend
 from knowledge_runtime.v2.contracts import IndexPublishResult
 from knowledge_runtime.v2.ingestion import IngestionService, stable_document_id
 from knowledge_runtime.v2.providers import LocalProvider, ParserRouter
+from knowledge_runtime.v2.quality import QualityDecision
 
 
 def make_service(tmp_path: Path, *, index=None) -> IngestionService:
@@ -54,6 +55,42 @@ def test_changed_source_publishes_new_revision(tmp_path: Path) -> None:
     assert len(service.canonical.list_revisions(first.document_id)) == 2
 
 
+def test_ingest_persists_raw_and_document_ir_artifacts_with_a_terminal_job(tmp_path: Path) -> None:
+    source = tmp_path / "policy.md"
+    source.write_text("# Scope\n\nReserve margin applies to annuity risk.\n", encoding="utf-8")
+    service = make_service(tmp_path)
+
+    result = service.ingest(source, provider="local")
+    ir = service.canonical.get_ir(result.document_id, result.revision_id)
+    jobs = service.canonical.list_ingestion_jobs(result.document_id)
+
+    assert result.state == "CURRENT_REVISION_PUBLISHED"
+    assert {ref.kind for ref in ir.source_artifacts} == {"source", "document-ir"}
+    assert {ref.object_key.rsplit("/", 1)[-1] for ref in ir.source_artifacts} == {"policy.md", "document-ir.json"}
+    assert jobs[-1]["state"] == "SEMANTIC_ENRICHMENT_PENDING"
+    assert jobs[-1]["history"][-2:] == ["CURRENT_REVISION_PUBLISHED", "SEMANTIC_ENRICHMENT_PENDING"]
+
+
+class EscalatingQualityGate:
+    def evaluate(self, report):
+        return QualityDecision("ESCALATED", "manual_review_required")
+
+
+def test_quality_escalation_records_a_terminal_job_without_publishing(tmp_path: Path) -> None:
+    source = tmp_path / "policy.md"
+    source.write_text("# Scope\n\nReserve margin applies to annuity risk.\n", encoding="utf-8")
+    service = make_service(tmp_path)
+    service.quality = EscalatingQualityGate()
+
+    result = service.ingest(source, provider="local")
+    jobs = service.canonical.list_ingestion_jobs(result.document_id)
+
+    assert result.state == "ESCALATED"
+    assert service.canonical.current_revision(result.document_id) is None
+    assert jobs[-1]["state"] == "ESCALATED"
+    assert jobs[-1]["history"][-1] == "ESCALATED"
+
+
 class FailingIndex:
     def publish_revision(self, revision, **kwargs):
         raise RuntimeError("index unavailable")
@@ -89,6 +126,13 @@ def test_index_failure_does_not_replace_current(tmp_path: Path) -> None:
 
     assert result.state == "FAILED"
     assert service.canonical.current_revision(first.document_id) == first.revision_id
+    job = next(
+        item
+        for item in service.canonical.list_ingestion_jobs(first.document_id)
+        if item["revision_id"] == result.revision_id
+    )
+    assert job["state"] == "FAILED"
+    assert job["history"][-1] == "FAILED"
 
 
 def test_failed_index_result_does_not_replace_current(tmp_path: Path) -> None:
