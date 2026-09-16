@@ -5,6 +5,7 @@ from pathlib import Path
 
 from knowledge_runtime.v2.cli import main
 from knowledge_runtime.v2.config import RuntimeConfig
+from knowledge_runtime.v2.contracts import EvidenceRef
 from knowledge_runtime.v2.runtime import build_runtime
 
 
@@ -47,3 +48,22 @@ def test_separate_cli_commands_share_the_durable_local_runtime(tmp_path: Path, m
 
     assert searched["items"]
     assert {item["ref"]["revision_id"] for item in searched["items"]} == {ingested["revision_id"]}
+
+
+def test_runtime_bundle_reopens_persisted_semantic_proposals(tmp_path: Path) -> None:
+    config = RuntimeConfig.test_private(local_state_path=str(tmp_path / "runtime.sqlite"))
+    first = build_runtime(config)
+    proposal = first.proposals.create(
+        kind="term",
+        payload={"term": "Reserve Margin"},
+        evidence_refs=(EvidenceRef("doc-1", "rev-1", "el-1"),),
+        extractor_version="test",
+        confidence=0.8,
+    )
+    first.proposals.transition(proposal.proposal_id, "AUTO_ACCEPTED")
+    first.proposals.transition(proposal.proposal_id, "VERIFIED")
+    first.close()
+
+    second = build_runtime(config)
+
+    assert [item.proposal_id for item in second.proposals.list_eligible()] == [proposal.proposal_id]

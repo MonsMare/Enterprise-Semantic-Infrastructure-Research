@@ -12,6 +12,13 @@ from .contracts import IndexRebuildRequest
 from .index import InMemoryIndexBackend, IndexBackend, OpenSearchIndexBackend
 from .ingestion import IngestionService
 from .providers import LocalProvider, MinerUProvider, ParserRouter
+from .semantic import (
+    InMemoryProposalStore,
+    PostgresProposalStore,
+    ProposalStore,
+    SemanticEnrichmentWorker,
+    SqliteProposalStore,
+)
 
 
 @dataclass(frozen=True)
@@ -23,11 +30,16 @@ class RuntimeBundle:
     index: IndexBackend
     context: ContextRuntime
     ingestion: IngestionService
+    proposals: ProposalStore
+    semantic_worker: SemanticEnrichmentWorker
 
     def close(self) -> None:
-        close = getattr(self.canonical, "close", None)
-        if close is not None:
-            close()
+        proposal_close = getattr(self.proposals, "close", None)
+        if proposal_close is not None:
+            proposal_close()
+        canonical_close = getattr(self.canonical, "close", None)
+        if canonical_close is not None:
+            canonical_close()
 
 
 def build_runtime(
@@ -36,6 +48,7 @@ def build_runtime(
     canonical: CanonicalStore | None = None,
     artifacts: ArtifactStore | None = None,
     index: IndexBackend | None = None,
+    proposals: ProposalStore | None = None,
 ) -> RuntimeBundle:
     """Build L1 once and make the in-memory derived index recoverable.
 
@@ -47,12 +60,13 @@ def build_runtime(
     chosen_canonical = canonical or _canonical_store(config)
     chosen_artifacts = artifacts or _artifact_store(config)
     chosen_index = index or _index_store(config, chosen_canonical)
+    chosen_proposals = proposals or _proposal_store(chosen_canonical)
     if isinstance(chosen_index, InMemoryIndexBackend):
         chosen_index.rebuild(IndexRebuildRequest(index_version="local-startup-rebuild"))
     local = LocalProvider(config)
     remote = MinerUProvider(config=config) if config.allow_remote_parser else None
     router = ParserRouter(config=config, local=local, remote=remote)
-    context = ContextRuntime(canonical=chosen_canonical, index=chosen_index)
+    context = ContextRuntime(canonical=chosen_canonical, index=chosen_index, overlay=chosen_proposals)
     ingestion = IngestionService(
         router=router,
         quality=None,
@@ -60,12 +74,15 @@ def build_runtime(
         artifacts=chosen_artifacts,
         index=chosen_index,
     )
+    semantic_worker = SemanticEnrichmentWorker(proposals=chosen_proposals)
     return RuntimeBundle(
         canonical=chosen_canonical,
         artifacts=chosen_artifacts,
         index=chosen_index,
         context=context,
         ingestion=ingestion,
+        proposals=chosen_proposals,
+        semantic_worker=semantic_worker,
     )
 
 
@@ -73,6 +90,14 @@ def _canonical_store(config: RuntimeConfig) -> CanonicalStore:
     if config.database_url:
         return PostgresCanonicalStore(config.database_url)
     return SqliteCanonicalStore(config.local_state_path)
+
+
+def _proposal_store(canonical: CanonicalStore) -> ProposalStore:
+    if isinstance(canonical, PostgresCanonicalStore):
+        return PostgresProposalStore(canonical.connection)
+    if isinstance(canonical, SqliteCanonicalStore):
+        return SqliteProposalStore(canonical.connection)
+    return InMemoryProposalStore()
 
 
 def _artifact_store(config: RuntimeConfig) -> ArtifactStore:
