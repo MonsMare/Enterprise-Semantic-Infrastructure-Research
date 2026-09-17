@@ -1,0 +1,10 @@
+# 本地 C&CC Claude Code Bridge 配置。相对路径以本文件所在 config/ 目录为基准。
+[runner]
+data_dir = "../.cacc-claude-bridge-data"
+# 使用本机 Claude Code；CC Switch 的模型和路由设置由 Claude Code 的用户配置读取。
+claude_command = "claude"
+max_turns = 40
+
+[projects."knowledge-runtime"]
+# 只登记允许 Codex 委派任务的本机仓库根目录。
+root = "../.."

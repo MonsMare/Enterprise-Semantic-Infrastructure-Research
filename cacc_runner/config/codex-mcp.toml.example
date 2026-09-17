@@ -1,0 +1,5 @@
+# 将本段合并到本机 Codex config.toml 的对应位置，并替换为实际绝对路径。
+[mcp_servers.cacc_runner]
+command = "C:/path/to/cacc_runner/.venv/Scripts/python.exe"
+args = ["-m", "cacc_runner.server"]
+env = { CACC_RUNNER_CONFIG = "C:/path/to/cacc_runner/config/projects.toml" }

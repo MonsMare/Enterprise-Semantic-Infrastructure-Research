@@ -1,0 +1,7 @@
+.venv/
+.cacc-runner-data/
+.cacc-claude-bridge-data/
+config/projects.toml
+__pycache__/
+*.py[cod]
+src/*.egg-info/
