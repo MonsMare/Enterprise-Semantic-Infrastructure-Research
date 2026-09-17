@@ -16,6 +16,7 @@ from .contracts import (
 from .config import RuntimeConfig
 from .context import ContextRuntime, RetrievalBudget
 from .access import KnowledgeAccessRuntime
+from .agent_runtime import AgentRunResult, AgentRuntime, AgentSession
 from .runtime import RuntimeBundle, build_runtime
 
 __all__ = [
@@ -32,6 +33,9 @@ __all__ = [
     "RuntimeConfig",
     "ContextRuntime",
     "KnowledgeAccessRuntime",
+    "AgentRunResult",
+    "AgentRuntime",
+    "AgentSession",
     "RetrievalBudget",
     "RuntimeBundle",
     "build_runtime",
